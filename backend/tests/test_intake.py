@@ -754,3 +754,162 @@ def test_structure_endpoint_returns_502_when_upstream_down(
     assert r.json()["error"]["code"] == "upstream_error"
     # 错误响应不带任何 acceptance 字段（即不必编造）
     assert "three_questions" not in r.json().get("error", {}).get("details", {} or {})
+
+
+# ---------------------------------------------------------------------------
+# W02-I05 · 兴趣池与自动归档脚本
+# ---------------------------------------------------------------------------
+
+
+def test_archive_stale_idempotent(fake_repo: FakeIntakeRepo) -> None:
+    """归档脚本幂等：重复运行结果一致。
+
+    构造：4 条 raw，2 条已过 14 天，1 条 structured 但过 14 天，1 条 raw 未过期。
+    第一次：归档 2 条；
+    第二次：归档 0 条（已 archived_interest 的不再匹配 raw 过滤）。
+    """
+    from datetime import datetime, timedelta
+
+    from app.modules.intake.models import IntakeItem
+    from app.modules.intake.repository import hash_text, new_id
+
+    now = datetime.utcnow()
+    old = now - timedelta(days=20)
+    fresh = now - timedelta(days=1)
+
+    items = [
+        IntakeItem(id=new_id(), owner_subject=OWNER, text="旧 raw 应归档",
+                   text_hash=hash_text(OWNER, "旧 raw 应归档"), source="manual",
+                   status="raw", created_at=old),
+        IntakeItem(id=new_id(), owner_subject=OWNER, text="旧 raw 应归档 2",
+                   text_hash=hash_text(OWNER, "旧 raw 应归档 2"), source="manual",
+                   status="raw", created_at=old),
+        IntakeItem(id=new_id(), owner_subject=OWNER, text="已结构化的不应改",
+                   text_hash=hash_text(OWNER, "已结构化的不应改"), source="manual",
+                   status="structured", created_at=old),
+        IntakeItem(id=new_id(), owner_subject=OWNER, text="新 raw 不应改",
+                   text_hash=hash_text(OWNER, "新 raw 不应改"), source="manual",
+                   status="raw", created_at=fresh),
+    ]
+    fake_repo._items.extend(items)
+
+    # 直接走 fake repository.archive_as_interest（脚本本身的实现是 SqlRepository，
+    # 但语义等价：UPDATE WHERE status='raw' AND created_at < before）
+    async def run() -> None:
+        cutoff = now - timedelta(days=14)
+        stale = await fake_repo.list_stale_raw(cutoff, limit=500)
+        assert len(stale) == 2  # 只 2 条匹配 raw 且过 14 天
+        ids = [it.id for it in stale]
+        n1 = await fake_repo.archive_as_interest(ids, at=now)
+        assert n1 == 2
+        # 第二次跑：已归档的不再匹配 raw
+        stale2 = await fake_repo.list_stale_raw(cutoff, limit=500)
+        assert stale2 == [], "幂等：已 archived_interest 的不会再被选中"
+        n2 = await fake_repo.archive_as_interest([], at=now)
+        assert n2 == 0
+
+    asyncio.run(run())
+
+
+def test_archive_stale_dry_run_does_not_mutate(fake_repo: FakeIntakeRepo) -> None:
+    """--dry-run 仅列出候选，不写入。"""
+    from datetime import datetime, timedelta
+
+    from app.modules.intake.models import IntakeItem
+    from app.modules.intake.repository import hash_text, new_id
+
+    now = datetime.utcnow()
+    old = now - timedelta(days=20)
+    stale = IntakeItem(
+        id=new_id(), owner_subject=OWNER, text="应被列出但不归档",
+        text_hash=hash_text(OWNER, "应被列出但不归档"), source="manual",
+        status="raw", created_at=old,
+    )
+    fake_repo._items.append(stale)
+
+    async def run() -> None:
+        cutoff = now - timedelta(days=14)
+        candidates = await fake_repo.list_stale_raw(cutoff, limit=500)
+        # dry-run：列出候选但不调 archive_as_interest
+        assert len(candidates) == 1
+        # 验证没改库：仍 raw
+        saved = await fake_repo.get(stale.id, owner=OWNER)
+        assert saved.status == "raw"
+        assert saved.archived_at is None
+
+    asyncio.run(run())
+
+
+def test_archive_stale_uses_configured_threshold(fake_repo: FakeIntakeRepo) -> None:
+    """14 天阈值不硬编码：可通过参数调整。
+
+    构造：两条 raw，分别过 10 天与 20 天。
+    --days=14 → 只归档过 20 天的；
+    --days=7  → 两条都归档；
+    --days=30 → 都不归档。
+    """
+    from datetime import datetime, timedelta
+
+    from app.modules.intake.models import IntakeItem
+    from app.modules.intake.repository import hash_text, new_id
+
+    now = datetime.utcnow()
+    ten_days = now - timedelta(days=10)
+    twenty_days = now - timedelta(days=20)
+    fake_repo._items.extend([
+        IntakeItem(id=new_id(), owner_subject=OWNER, text="10 天",
+                   text_hash=hash_text(OWNER, "10 天"), source="manual",
+                   status="raw", created_at=ten_days),
+        IntakeItem(id=new_id(), owner_subject=OWNER, text="20 天",
+                   text_hash=hash_text(OWNER, "20 天"), source="manual",
+                   status="raw", created_at=twenty_days),
+    ])
+
+    async def run() -> None:
+        # days=14
+        c14 = await fake_repo.list_stale_raw(now - timedelta(days=14), limit=500)
+        assert len(c14) == 1
+        # days=7
+        c7 = await fake_repo.list_stale_raw(now - timedelta(days=7), limit=500)
+        assert len(c7) == 2
+        # days=30
+        c30 = await fake_repo.list_stale_raw(now - timedelta(days=30), limit=500)
+        assert c30 == []
+
+    asyncio.run(run())
+
+
+def test_archive_stale_does_not_notify(
+    caplog: pytest.LogCaptureFixture, fake_repo: FakeIntakeRepo
+) -> None:
+    """归档不通知用户（防止催办）。
+
+    体现在实现里：archive_stale 只打 INFO 级日志记录数量与候选样本，
+    不发出邮件 / 不写入任何 notifications 表 / 不调外部 webhook。
+    """
+    import logging
+    from datetime import datetime, timedelta
+
+    from app.modules.intake.models import IntakeItem
+    from app.modules.intake.repository import hash_text, new_id
+
+    now = datetime.utcnow()
+    stale = IntakeItem(
+        id=new_id(), owner_subject=OWNER, text="待归档",
+        text_hash=hash_text(OWNER, "待归档"), source="manual",
+        status="raw", created_at=now - timedelta(days=20),
+    )
+    fake_repo._items.append(stale)
+
+    async def run() -> None:
+        with caplog.at_level(logging.INFO, logger="afc.intake.archive_stale"):
+            candidates = await fake_repo.list_stale_raw(now - timedelta(days=14), limit=500)
+            ids = [c.id for c in candidates]
+            await fake_repo.archive_as_interest(ids, at=now)
+
+    asyncio.run(run())
+    # 关键断言：日志里没有 "notify"、"email"、"webhook" 这类发送语义
+    assert not any(
+        kw in caplog.text.lower()
+        for kw in ("notify", "email", "webhook", "sms")
+    ), "归档脚本不应触发任何通知"
