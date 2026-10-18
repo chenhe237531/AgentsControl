@@ -22,6 +22,7 @@
 | POST | `/api/v1/execution/workers/{id}/heartbeat` | 续约（带进度才落事件） | W06-I01 |
 | POST | `/api/v1/execution/workers/{id}/complete` | 交货（result 必带产物引用+成本） | W06-I01 |
 | POST | `/api/v1/execution/workers/{id}/fail` | 报错（retryable 语义） | W06-I01 |
+| GET | `/api/v1/execution/orca/health` | Orca 能力自检（缓存 10 分钟，`?force=1` 强制重探） | W06-I02 |
 
 ## 认证
 

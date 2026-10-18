@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 
 from app.core.security import create_token
 from app.main import create_app
+from app.modules.execution import orca as exec_orca
 from app.modules.execution import protocol as proto
 from app.modules.execution.protocol import LeasedTask
 from app.modules.execution.repository import EventRecord, WorkerInfo
@@ -419,3 +420,174 @@ class TestTasksServiceGatewayContract:
         gw = proto.TasksServiceGateway()
         with pytest.raises(proto.TasksUnavailableError):
             await gw.lease(capabilities=[], slots=1, machine=None)
+
+
+# ================================================================ W06-I02 · Orca probe
+
+@dataclass
+class FakeOrcaRunner:
+    """按子命令返回预设输出的假 CLI。"""
+
+    outputs: dict[str, exec_orca.RunnerResult]
+    calls: list[list[str]] = field(default_factory=list)
+
+    async def run(self, args: list[str], *, timeout: float = 5.0) -> exec_orca.RunnerResult:
+        self.calls.append(args)
+        for key, result in self.outputs.items():
+            if key in args:
+                return result
+        return exec_orca.RunnerResult(rc=0, stdout="", stderr="")
+
+
+def healthy_runner() -> FakeOrcaRunner:
+    return FakeOrcaRunner(
+        outputs={
+            "--version": exec_orca.RunnerResult(rc=0, stdout="orca 0.3.1 (build 42)", stderr=""),
+            "agents": exec_orca.RunnerResult(
+                rc=0, stdout='{"agents": ["claude-code", "opencode"]}', stderr=""
+            ),
+        }
+    )
+
+
+class TestOrcaProbe:
+    async def test_probe_happy_path(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(exec_orca.shutil, "which", lambda _: "/usr/local/bin/orca")
+        result = await exec_orca.probe(
+            healthy_runner(), worktree_root=str(tmp_path)
+        )
+        assert result.available is True
+        assert result.version == "0.3.1"
+        assert result.cli_path == "/usr/local/bin/orca"
+        assert result.agents == ("claude-code", "opencode")
+        assert result.worktree_root_writable is True
+        assert result.error is None
+
+    async def test_probe_reports_missing_cli(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(exec_orca.shutil, "which", lambda _: None)
+        result = await exec_orca.probe(
+            healthy_runner(), worktree_root=str(tmp_path)
+        )
+        assert result.available is False
+        assert "未找到 Orca CLI" in (result.error or "")
+
+    async def test_probe_reports_format_change_explicitly(self, tmp_path, monkeypatch):
+        """I02 验收 ③：版本输出格式变化 → 明确错误，不空指针。"""
+        monkeypatch.setattr(exec_orca.shutil, "which", lambda _: "/bin/orca")
+        runner = FakeOrcaRunner(
+            outputs={
+                "--version": exec_orca.RunnerResult(
+                    rc=0, stdout="completely-unrecognizable-garbage", stderr=""
+                )
+            }
+        )
+        result = await exec_orca.probe(runner, worktree_root=str(tmp_path))
+        assert result.available is False
+        assert "Orca CLI 输出格式变了" in (result.error or "")
+
+    async def test_probe_reports_version_command_failure(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(exec_orca.shutil, "which", lambda _: "/bin/orca")
+        runner = FakeOrcaRunner(
+            outputs={
+                "--version": exec_orca.RunnerResult(rc=2, stdout="", stderr="boom")
+            }
+        )
+        result = await exec_orca.probe(runner, worktree_root=str(tmp_path))
+        assert result.available is False
+        assert "退出码 2" in (result.error or "")
+
+    async def test_probe_rejects_unwritable_worktree_root(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(exec_orca.shutil, "which", lambda _: "/bin/orca")
+        missing = tmp_path / "no-such-dir"
+        result = await exec_orca.probe(
+            healthy_runner(), worktree_root=str(missing)
+        )
+        assert result.available is False
+        assert "worktree 根目录不可写" in (result.error or "")
+
+    async def test_probe_degrades_gracefully_when_agents_unavailable(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(exec_orca.shutil, "which", lambda _: "/bin/orca")
+        runner = healthy_runner()
+        runner.outputs["agents"] = exec_orca.RunnerResult(rc=1, stdout="", stderr="nope")
+        result = await exec_orca.probe(runner, worktree_root=str(tmp_path))
+        assert result.available is True  # agents 列举失败只降级
+        assert result.agents == ()
+        assert result.details.get("agents_error")
+
+
+class TestOrcaHealthEndpoint:
+    def test_health_serves_cached_probe_without_reprobing(self, monkeypatch):
+        cached = exec_orca.OrcaProbeResult(
+            available=True,
+            checked_at=utcnow(),
+            cli_path="/bin/orca",
+            version="0.3.1",
+            agents=("claude-code",),
+            worktree_root="/x/.worktrees",
+            worktree_root_writable=True,
+        )
+        probed = {"count": 0}
+
+        import json as _json
+
+        async def fake_cache_get(key):
+            assert key == exec_orca.PROBE_CACHE_KEY
+            return _json.dumps(cached.to_dict())
+
+        async def fake_cache_set(key, value, ttl_seconds):
+            assert ttl_seconds == exec_orca.PROBE_TTL_SECONDS
+
+        async def fail_probe(*args, **kwargs):
+            probed["count"] += 1
+            raise AssertionError("命中缓存时不应重新探测")
+
+        monkeypatch.setattr(exec_orca, "cache_get", fake_cache_get)
+        monkeypatch.setattr(exec_orca, "cache_set", fake_cache_set)
+        monkeypatch.setattr(exec_orca, "probe", fail_probe)
+        app = create_app()
+        with TestClient(app) as c:
+            r = c.get("/api/v1/execution/orca/health", headers=AUTH)
+        assert r.status_code == 200
+        body = r.json()
+        assert body["available"] is True
+        assert body["version"] == "0.3.1"
+        assert body["agents"] == ["claude-code"]
+        assert probed["count"] == 0
+
+    def test_health_probes_and_caches_on_cold_start(self, tmp_path, monkeypatch):
+        fresh = exec_orca.OrcaProbeResult(
+            available=False,
+            checked_at=utcnow(),
+            error="未找到 Orca CLI：PATH 中无 `orca`，无法派 Orca 类任务",
+        )
+        set_calls: list[tuple[str, int]] = []
+
+        async def fake_cache_get(key):
+            return None
+
+        async def fake_cache_set(key, value, ttl_seconds):
+            set_calls.append((key, ttl_seconds))
+
+        async def fake_probe(*args, **kwargs):
+            return fresh
+
+        monkeypatch.setattr(exec_orca, "cache_get", fake_cache_get)
+        monkeypatch.setattr(exec_orca, "cache_set", fake_cache_set)
+        monkeypatch.setattr(exec_orca, "probe", fake_probe)
+        monkeypatch.setattr(exec_orca, "REFRESHER_ENABLED", False)
+        app = create_app()
+        with TestClient(app) as c:
+            r = c.get("/api/v1/execution/orca/health", headers=AUTH)
+        assert r.status_code == 200
+        body = r.json()
+        assert body["available"] is False
+        assert "未找到 Orca CLI" in body["error"]
+        assert set_calls == [(exec_orca.PROBE_CACHE_KEY, exec_orca.PROBE_TTL_SECONDS)]
+
+    def test_health_requires_auth(self, monkeypatch):
+        app = create_app()
+        with TestClient(app) as c:
+            r = c.get("/api/v1/execution/orca/health")
+        assert r.status_code == 401

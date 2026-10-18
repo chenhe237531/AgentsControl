@@ -2,7 +2,7 @@
 
 HTTP 端点分四组（按 issue 顺序落地）：
 - Worker 协议：claim / heartbeat / complete / fail（W06-I01）
-- Orca 自检：GET /orca/health（W06-I02）
+- Orca 自检：GET /orca/health（W06-I02）——探测失败 → available=false，拒绝派 Orca 类任务
 - 会话生命周期：POST /sessions、DELETE /sessions/{id}（W06-I03）
 - 会话控制与归集：spawn/send/steer/kill/harvest（W06-I04、W06-I05）
 - 会话视图：GET /sessions、GET /sessions/{id}（W06-I06）
@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.db import get_db
 from app.core.deps import OwnerDep
 from app.core.errors import NotImplementedYetError
+from app.modules.execution import orca as exec_orca
 from app.modules.execution import protocol as proto
 from app.modules.execution import service as svc
 from app.modules.execution.repository import (
@@ -35,6 +36,7 @@ from app.modules.execution.repository import (
     SqlWorkerStore,
     WorkerStore,
 )
+from app.modules.execution.schemas import OrcaHealthView
 
 MODULE = "execution"
 OWNER_WINDOW = "W06"
@@ -85,6 +87,29 @@ async def module_ping(_: OwnerDep) -> dict[str, str]:
     等 marshal 在共享 PR 里重建快照基线时一并移除（对 W09 的 handoff 已注明）。
     """
     raise NotImplementedYetError(MODULE)
+
+
+# ---------------------------------------------------------------- Orca 自检（W06-I02）
+
+@router.get(
+    "/orca/health",
+    summary="Orca 能力自检（CLI/版本/agent 种类/worktree 根可写），结果缓存 10 分钟",
+    response_model=OrcaHealthView,
+)
+async def orca_health(_: OwnerDep, force: bool = False) -> OrcaHealthView:
+    """探测失败 → available=false；派 Orca 类任务前必须先看这里。"""
+    result = await exec_orca.get_orca_status(force=force)
+    return OrcaHealthView(
+        available=result.available,
+        checked_at=result.checked_at,
+        cli_path=result.cli_path,
+        version=result.version,
+        agents=list(result.agents),
+        worktree_root=result.worktree_root,
+        worktree_root_writable=result.worktree_root_writable,
+        error=result.error,
+        details=result.details,
+    )
 
 
 # ---------------------------------------------------------------- Worker 协议（W06-I01）
