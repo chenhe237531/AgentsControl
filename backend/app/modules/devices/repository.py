@@ -325,3 +325,75 @@ class DeviceRepository:
             }
             for r in rows
         ]
+
+    # ------------------------------------------------------------- 指令下发（I06）
+
+    async def create_command(
+        self, node_id: str, *, kind: str, payload: dict, approved_by: str | None
+    ) -> dict:
+        row = models.DeviceCommand(
+            node_id=node_id, kind=kind, payload=payload, approved_by=approved_by
+        )
+        self.session.add(row)
+        await self.session.flush()
+        return _command_to_dict(row)
+
+    async def get_command(self, command_id: str) -> dict | None:
+        try:
+            stmt = select(models.DeviceCommand).where(models.DeviceCommand.id == command_id)
+            row = (await self.session.execute(stmt)).scalar_one_or_none()
+        except ValueError:
+            return None  # 非 UUID 直接视为不存在
+        return _command_to_dict(row) if row else None
+
+    async def pull_pending_command(self, node_id: str, *, now: datetime) -> dict | None:
+        """原子领取最旧 pending（UPDATE ... WHERE status='pending'，防重复下发）。"""
+        from sqlalchemy import update
+
+        subq = (
+            select(models.DeviceCommand.id)
+            .where(
+                models.DeviceCommand.node_id == node_id,
+                models.DeviceCommand.status == "pending",
+            )
+            .order_by(models.DeviceCommand.created_at.asc())
+            .limit(1)
+            .scalar_subquery()
+        )
+        stmt = (
+            update(models.DeviceCommand)
+            .where(models.DeviceCommand.id == subq)
+            .values(status="delivered", delivered_at=now)
+            .returning(models.DeviceCommand)
+        )
+        row = (await self.session.execute(stmt)).scalar_one_or_none()
+        return _command_to_dict(row) if row else None
+
+    async def ack_command(
+        self, command_id: str, *, status: str, detail: str, now: datetime
+    ) -> dict | None:
+        from sqlalchemy import update
+
+        stmt = (
+            update(models.DeviceCommand)
+            .where(models.DeviceCommand.id == command_id)
+            .values(status=status, detail=detail, acked_at=now)
+            .returning(models.DeviceCommand)
+        )
+        row = (await self.session.execute(stmt)).scalar_one_or_none()
+        return _command_to_dict(row) if row else None
+
+
+def _command_to_dict(row: models.DeviceCommand) -> dict:
+    return {
+        "id": str(row.id),
+        "node_id": row.node_id,
+        "kind": row.kind,
+        "payload": dict(row.payload or {}),
+        "approved_by": row.approved_by,
+        "status": row.status,
+        "detail": row.detail,
+        "created_at": row.created_at,
+        "delivered_at": row.delivered_at,
+        "acked_at": row.acked_at,
+    }

@@ -205,3 +205,34 @@ class DeviceCapEvent(Base):
                                           server_default=text("'[]'::jsonb"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False,
                                                  server_default=func.now())
+
+
+class DeviceCommand(Base):
+    """下发给设备的指令（白名单五种，永不支持任意 shell）。
+
+    生命周期：pending →(设备长轮询领取) delivered →(ack) acked/failed。
+    设备在 NAT 后只能主动拉，长轮询超时 204。
+    """
+
+    __tablename__ = "device_commands"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.gen_random_uuid()
+    )
+    node_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("devices.node_id", ondelete="CASCADE"), nullable=False
+    )
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict,
+                                          server_default=text("'{}'::jsonb"))
+    # 中风险指令（restart_agent / run_task）必须记录审批人
+    approved_by: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending",
+                                        server_default="pending")
+    detail: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False,
+                                                 server_default=func.now())
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    acked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (Index("ix_device_commands_node_status", "node_id", "status", "created_at"),)

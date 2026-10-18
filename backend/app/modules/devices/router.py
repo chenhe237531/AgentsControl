@@ -10,7 +10,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Response
 
 from app.core.deps import OwnerDep
 from app.core.errors import ConflictError, ForbiddenError
@@ -19,6 +19,9 @@ from . import hmac as device_hmac
 from .deps import DeviceServiceDep
 from .schemas import (
     BootstrapCodeOut,
+    CommandAckIn,
+    CommandCreateIn,
+    CommandOut,
     DeviceOut,
     DevicePatchIn,
     DeviceStatusOut,
@@ -180,3 +183,48 @@ async def list_snapshots(
 ) -> list[SnapshotOut]:
     data = await service.list_snapshots(node_id, limit=limit)
     return [SnapshotOut(**row) for row in data["snapshots"]]
+
+
+# ---------------------------------------------------------------------------
+# I06 · 指令下发（下发 = owner 认证；长轮询/ack = device HMAC 认证）
+# ---------------------------------------------------------------------------
+
+
+@router.post("/{node_id}/commands", response_model=CommandOut, summary="下发指令（白名单五种）")
+async def create_command(
+    node_id: str, payload: CommandCreateIn, _: OwnerDep, service: DeviceServiceDep
+) -> CommandOut:
+    command = await service.create_command(
+        node_id,
+        kind=payload.kind,
+        payload=payload.payload,
+        approved_by=payload.approved_by,
+    )
+    return CommandOut(**command)
+
+
+@router.get("/{node_id}/commands", summary="指令长轮询（设备拉取，超时 204）")
+async def pull_commands(
+    node_id: str,
+    service: DeviceServiceDep,
+    wait: int = Query(default=0, ge=0, le=25),
+    principal: device_hmac.DevicePrincipal = Depends(device_hmac.verify_device_signature),
+) -> Response:
+    if principal.node_id != node_id:
+        raise ForbiddenError("长轮询节点与签名节点不一致")
+    if principal.trust == "third_party":
+        raise ForbiddenError("第三方设备不接收指令")
+    return await device_hmac.long_poll(service, node_id, wait=wait)
+
+
+@router.post("/commands/{command_id}/ack", response_model=CommandOut, summary="指令回执")
+async def ack_command(
+    command_id: str,
+    payload: CommandAckIn,
+    service: DeviceServiceDep,
+    principal: device_hmac.DevicePrincipal = Depends(device_hmac.verify_device_signature),
+) -> CommandOut:
+    command = await service.ack_command(
+        command_id, node_id=principal.node_id, status=payload.status, detail=payload.detail
+    )
+    return CommandOut(**command)

@@ -236,3 +236,32 @@ class SnapshotIngestOut(BaseModel):
     caps_removed: list[str]
     pruned: int
     woke_at: datetime
+
+
+# ---- I06 指令下发（白名单定义在 commands.py，本文件只做线格式） ----
+
+from .commands import COMMAND_KINDS, MEDIUM_RISK_KINDS, CommandKind  # noqa: E402, F401
+
+
+class CommandCreateIn(BaseModel):
+    kind: CommandKind  # 白名单之外的 kind 直接 422，永不支持任意 shell
+    payload: dict[str, Any] = Field(default_factory=dict)
+    approved_by: str | None = None
+
+
+class CommandOut(BaseModel):
+    id: str
+    node_id: str
+    kind: str
+    payload: dict[str, Any]
+    approved_by: str | None
+    status: str
+    detail: str = ""
+    created_at: datetime
+    delivered_at: datetime | None
+    acked_at: datetime | None
+
+
+class CommandAckIn(BaseModel):
+    status: Literal["acked", "failed"]
+    detail: str = ""

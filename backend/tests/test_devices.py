@@ -61,6 +61,8 @@ class FakeRepo:
         self.snapshots: dict[str, list[dict]] = {}
         self.cap_events: dict[str, list[dict]] = {}
         self.snap_seq = 0
+        self.commands: dict[str, dict] = {}
+        self.command_seq = 0
 
     async def commit(self) -> None:
         return None
@@ -208,6 +210,52 @@ class FakeRepo:
     async def list_snapshots(self, node_id: str, *, limit: int = 30) -> list[dict]:
         rows = list(reversed(self.snapshots.get(node_id, [])))
         return rows[:limit]
+
+    # ------------------------------------------------------------- 指令（I06）
+
+    async def create_command(
+        self, node_id: str, *, kind: str, payload: dict, approved_by: str | None
+    ) -> dict:
+        self.command_seq += 1
+        row = {
+            "id": f"cmd-{self.command_seq:04d}",
+            "node_id": node_id,
+            "kind": kind,
+            "payload": dict(payload),
+            "approved_by": approved_by,
+            "status": "pending",
+            "detail": "",
+            "created_at": T0,
+            "delivered_at": None,
+            "acked_at": None,
+        }
+        self.commands[row["id"]] = row
+        return dict(row)
+
+    async def get_command(self, command_id: str) -> dict | None:
+        row = self.commands.get(command_id)
+        return dict(row) if row else None
+
+    async def pull_pending_command(self, node_id: str, *, now: datetime) -> dict | None:
+        pending = sorted(
+            (r for r in self.commands.values() if r["node_id"] == node_id and r["status"] == "pending"),
+            key=lambda r: r["created_at"],
+        )
+        if not pending:
+            return None
+        row = pending[0]
+        row["status"] = "delivered"
+        row["delivered_at"] = now
+        return dict(row)
+
+    async def ack_command(self, command_id: str, *, status: str, detail: str, now: datetime) -> dict | None:
+        row = self.commands.get(command_id)
+        if row is None:
+            return None
+        row["status"] = status
+        row["detail"] = detail
+        row["acked_at"] = now
+        return dict(row)
 
 
 class FakeState:
@@ -834,3 +882,132 @@ class TestSnapshot:
         assert stored[1]["is_backfill"] is True  # 快照之后到达但 occurred_at 更早 → 回填标
         # 当前能力/快照视图不被早到的增量破坏
         assert fake.repo.devices["mac-1"].last_snapshot_at is not None
+
+
+def device_pull(client: TestClient, token: str, node_id: str, *, wait: int = 0):
+    """设备长轮询拉指令：GET 无 body，签名覆盖空 body。"""
+    return device_signed_request(client, "GET", f"{API}/{node_id}/commands?wait={wait}", token, node_id)
+
+
+def device_signed_request(
+    client: TestClient, method: str, path: str, token: str, node_id: str, payload: dict | None = None
+):
+    """以设备身份发 HMAC 签名请求（body 参与签名；GET 视为空 body）。"""
+    body = json.dumps(payload).encode() if payload is not None else b""
+    ts = int(time.time())
+    sig = sign_hmac(hash_device_token(token), body, ts)
+    kwargs: dict = {"headers": {
+        "Content-Type": "application/json",
+        "X-Afc-Node": node_id,
+        "X-Afc-Timestamp": str(ts),
+        "X-Afc-Signature": sig,
+    }}
+    if payload is not None:
+        kwargs["content"] = body
+    return client.request(method, path, **kwargs)
+
+
+# =========================================================================
+# W04-I06 · 指令下发白名单
+# =========================================================================
+
+
+class TestCommands:
+    def test_create_command_whitelist_only(self, client: TestClient, fake: FakeState, owner_headers) -> None:
+        register_device(client, fake, owner_headers, "mac-1")
+        # 白名单五种都允许（低风险不需要审批人）
+        r = client.post(f"{API}/mac-1/commands", headers=owner_headers, json={"kind": "collect_snapshot"})
+        assert r.status_code == 200
+        # 白名单之外（包括任意 shell）一律 422 —— 这是编译进 Literal 类型的硬约束
+        for bad in ("run_shell", "exec", "rm -rf /"):
+            r = client.post(f"{API}/mac-1/commands", headers=owner_headers, json={"kind": bad})
+            assert r.status_code == 422
+
+    def test_medium_risk_requires_approval(self, client: TestClient, fake: FakeState, owner_headers) -> None:
+        register_device(client, fake, owner_headers, "mac-1")
+        r = client.post(f"{API}/mac-1/commands", headers=owner_headers, json={"kind": "restart_agent"})
+        assert r.status_code == 409  # 未审批的中风险指令
+
+        r = client.post(
+            f"{API}/mac-1/commands",
+            headers=owner_headers,
+            json={"kind": "restart_agent", "approved_by": "owner-1"},
+        )
+        assert r.status_code == 200
+        assert next(iter(fake.repo.commands.values()))["approved_by"] == "owner-1"
+
+        r = client.post(f"{API}/mac-1/commands", headers=owner_headers, json={"kind": "run_task"})
+        assert r.status_code == 409
+        r = client.post(
+            f"{API}/mac-1/commands",
+            headers=owner_headers,
+            json={"kind": "run_task", "payload": {"task_id": "t-9"}, "approved_by": "owner-1"},
+        )
+        assert r.status_code == 200
+
+    def test_third_party_never_receives_commands(self, client: TestClient, fake: FakeState, owner_headers) -> None:
+        register_device(client, fake, owner_headers, "api-ext", trust="third_party")
+        # 控制台下发 → 403
+        r = client.post(f"{API}/api-ext/commands", headers=owner_headers, json={"kind": "collect_snapshot"})
+        assert r.status_code == 403
+
+        # 设备自己来长轮询拉 → 403
+        code = issue_code(client, owner_headers)
+        reg = client.post(
+            f"{API}/register",
+            json={"bootstrap_code": code, "node_id": "api-2", "fingerprint": "fp-api-2",
+                  "trust": "third_party"},
+        )
+        r = device_pull(client, reg.json()["token"], "api-2", wait=0)
+        assert r.status_code == 403
+
+    def test_long_poll_deliver_and_ack(self, client: TestClient, fake: FakeState, owner_headers) -> None:
+        reg = register_device(client, fake, owner_headers, "mac-1")
+        client.post(
+            f"{API}/mac-1/commands",
+            headers=owner_headers,
+            json={"kind": "run_task", "payload": {"task_id": "t-1"}, "approved_by": "owner-1"},
+        )
+        # 设备长轮询领取（wait=0 立即返回）
+        r = device_pull(client, reg["token"], "mac-1", wait=0)
+        assert r.status_code == 200
+        command = r.json()
+        assert command["kind"] == "run_task"
+        assert command["status"] == "delivered"
+
+        # 领取后队列里没有 pending → 204（不用 WebSocket）
+        r = device_pull(client, reg["token"], "mac-1", wait=0)
+        assert r.status_code == 204
+
+        # 回执（签名覆盖 body）
+        r = device_signed_request(
+            client, "POST", f"{API}/commands/{command['id']}/ack", reg["token"], "mac-1",
+            {"status": "acked", "detail": "done"},
+        )
+        assert r.status_code == 200
+        assert fake.repo.commands[command["id"]]["status"] == "acked"
+        assert fake.repo.commands[command["id"]]["detail"] == "done"
+
+    def test_ack_other_device_command_rejected(self, client: TestClient, fake: FakeState, owner_headers) -> None:
+        reg1 = register_device(client, fake, owner_headers, "mac-1")
+        register_device(client, fake, owner_headers, "mac-2")
+        client.post(f"{API}/mac-1/commands", headers=owner_headers, json={"kind": "drain"})
+        r = device_pull(client, reg1["token"], "mac-1", wait=0)
+        command_id = r.json()["id"]
+
+        reg2 = client.post(
+            f"{API}/register",
+            json={"bootstrap_code": issue_code(client, owner_headers), "node_id": "mac-3",
+                  "fingerprint": "fp-mac-3"},
+        )
+        # mac-3 用自己的合法签名 ack mac-1 的指令 → 403
+        r = device_signed_request(
+            client, "POST", f"{API}/commands/{command_id}/ack", reg2.json()["token"], "mac-3",
+            {"status": "acked"},
+        )
+        assert r.status_code == 403
+        assert fake.repo.commands[command_id]["status"] == "delivered"
+
+    def test_command_for_unknown_device_404(self, client: TestClient, fake: FakeState, owner_headers) -> None:
+        r = client.post(f"{API}/ghost/commands", headers=owner_headers, json={"kind": "drain"})
+        assert r.status_code == 404

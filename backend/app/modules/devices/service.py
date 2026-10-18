@@ -27,6 +27,7 @@ from app.core.errors import (
 )
 from app.core.security import hash_device_token
 
+from .commands import COMMAND_KINDS, MEDIUM_RISK_KINDS
 from .repository import DeviceRecord, DeviceRepository
 from .schemas import TRUST_VALUES, EventBatchIn, HeartbeatIn, RegisterIn, SnapshotIn
 
@@ -409,3 +410,37 @@ class DeviceService:
         await self._require_device(node_id)
         rows = await self._repo.list_snapshots(node_id, limit=limit)
         return {"node_id": node_id, "snapshots": rows}
+
+    # ------------------------------------------------------------- I06 指令下发
+
+    async def create_command(self, node_id: str, *, kind: str, payload: dict,
+                             approved_by: str | None) -> dict:
+        """控制台下发指令：白名单五种、永不支持任意 shell；中风险需审批人。"""
+        device = await self._require_device(node_id)
+        self._require_not_third_party(device, "指令")
+        if kind not in COMMAND_KINDS:
+            raise ValidationError("指令不在白名单内")
+        if kind in MEDIUM_RISK_KINDS and not approved_by:
+            raise ConflictError("中风险指令需要 approved_by 审批人")
+        command = await self._repo.create_command(
+            node_id, kind=kind, payload=payload, approved_by=approved_by
+        )
+        await self._repo.commit()
+        return command
+
+    async def pull_command(self, node_id: str) -> dict | None:
+        """设备拉取：原子领取最旧 pending（UPDATE...WHERE status='pending' 防重复下发）。"""
+        await self._require_device(node_id)
+        command = await self._repo.pull_pending_command(node_id, now=self._clock())
+        await self._repo.commit()
+        return command
+
+    async def ack_command(self, command_id: str, *, node_id: str, status: str, detail: str = "") -> dict:
+        command = await self._repo.get_command(command_id)
+        if command is None:
+            raise NotFoundError("指令不存在")
+        if command["node_id"] != node_id:
+            raise ForbiddenError("该指令不属于当前设备")
+        updated = await self._repo.ack_command(command_id, status=status, detail=detail, now=self._clock())
+        await self._repo.commit()
+        return updated or command
