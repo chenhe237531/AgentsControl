@@ -14,7 +14,7 @@ L0/L1/L2/L3 决策分级、审批流、带宽熔断（日决策数/否决率异�
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter
 
 from app.core.deps import OwnerDep
 from app.core.errors import NotImplementedYetError
