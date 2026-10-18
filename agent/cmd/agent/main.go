@@ -182,6 +182,7 @@ func heartbeatLoop(ctx context.Context, cfg *config.Config, c *collect.Collector
 func flushLoop(ctx context.Context, cfg *config.Config, buf buffer.Buffer, cl *transport.Client, gate *snapshotGate) {
 	ticker := time.NewTicker(cfg.FlushInterval)
 	defer ticker.Stop()
+	loggedOffline := false
 
 	for {
 		select {
@@ -192,6 +193,15 @@ func flushLoop(ctx context.Context, cfg *config.Config, buf buffer.Buffer, cl *t
 			if !gate.wait(ctx.Done()) {
 				return
 			}
+			// 离线/在线状态转换打一行日志，避免"一直失败"看不出来
+			if cl.IsOffline() && !loggedOffline {
+				slog.Warn("离线中：事件留在本地队列，恢复后自动续传", "buffer", cfg.BufferKind)
+				loggedOffline = true
+			} else if !cl.IsOffline() && loggedOffline {
+				slog.Info("已恢复在线")
+				loggedOffline = false
+			}
+
 			batch, err := buf.Peek(500)
 			if errors.Is(err, buffer.ErrEmpty) {
 				continue

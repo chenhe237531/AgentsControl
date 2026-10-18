@@ -72,7 +72,7 @@ func (g *snapshotGate) reset() {
 // 因此用心跳间隔启发式覆盖 99% 场景（睡眠时心跳不发，醒来后首跳间隔远超周期）。
 type wakeDetector struct {
 	threshold time.Duration
-	last       time.Time
+	last      time.Time
 }
 
 // observe 检查本次心跳间隔是否暗示睡眠唤醒。

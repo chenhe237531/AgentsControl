@@ -29,7 +29,7 @@ func TestWakeDetectorNormalGapNotWake(t *testing.T) {
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	w.observe(base)
 	// 90 秒间隔，阈值 150 秒，不应判唤醒
-	if w.observe(base.Add(90*time.Second)) {
+	if w.observe(base.Add(90 * time.Second)) {
 		t.Fatal("正常间隔不应判唤醒")
 	}
 }

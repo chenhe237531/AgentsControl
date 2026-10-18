@@ -26,6 +26,7 @@ type Client struct {
 	nodeID  string
 	secret  string
 	hc      *http.Client
+	state   *onlineState
 }
 
 func New(baseURL, nodeID, secret string) *Client {
@@ -41,8 +42,12 @@ func New(baseURL, nodeID, secret string) *Client {
 				IdleConnTimeout:     90 * time.Second,
 			},
 		},
+		state: newOnlineState(),
 	}
 }
+
+// IsOffline 暴露给 main 包用于打"离线中"日志。
+func (c *Client) IsOffline() bool { return c.state.IsOffline() }
 
 // StatusError 表示服务端明确拒绝（4xx），不应重试。
 type StatusError struct {
@@ -54,6 +59,8 @@ func (e *StatusError) Error() string {
 	return fmt.Sprintf("upstream %d: %s", e.Status, e.Body)
 }
 
+// Post 重试上限：网络错误/5xx 最多 5 次，退避指数到 5 min 封顶；
+// 4xx 不重试。状态机记录在线/离线，便于上层日志区分"离线中"与"瞬时抖动"。
 func (c *Client) Post(ctx context.Context, path string, payload any) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -61,24 +68,30 @@ func (c *Client) Post(ctx context.Context, path string, payload any) error {
 	}
 
 	var lastErr error
-	backoff := 500 * time.Millisecond
-	for attempt := 0; attempt < 3; attempt++ {
+	const maxAttempts = 5
+	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {
+			bo := c.state.nextBackoff()
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case <-time.After(backoff):
+			case <-time.After(bo):
 			}
-			backoff *= 2
 		}
 
 		err := c.once(ctx, path, body)
 		if err == nil {
+			c.state.markSuccess()
 			return nil
 		}
 		var se *StatusError
 		if errors.As(err, &se) {
+			c.state.markFailure()
 			return err // 4xx：不重试
+		}
+		if justOff := c.state.markFailure(); justOff {
+			// 第一次进入离线——这里只标记，由调用方根据 IsOffline 打日志
+			_ = justOff
 		}
 		lastErr = err
 	}

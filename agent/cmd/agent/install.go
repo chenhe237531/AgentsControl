@@ -33,9 +33,9 @@ const (
 // installCmd 解析 install 子命令参数。
 // 需要把运行时环境变量写进服务定义，避免"装好了但起不来"。
 type installCmd struct {
-	binary       string
-	envFile      string
-	extraArgs    []string
+	binary    string
+	envFile   string
+	extraArgs []string
 }
 
 func (c *installCmd) parse(args []string) error {

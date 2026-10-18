@@ -30,12 +30,17 @@ import (
 type SQLite struct {
 	mu       sync.Mutex
 	db       *sql.DB
+	dbPath   string
 	maxBytes int64
 	maxAge   time.Duration
 
 	// 缓存：避免每次 Seq()/Dropped() 都查库
-	nextSeq  uint64
-	dropped  uint64 // 自上次 Ack 后新增的丢失数；Ack 时清零并随批次上报
+	nextSeq uint64
+	dropped uint64 // 自上次 Ack 后新增的丢失数；Ack 时清零并随批次上报
+
+	// 磁盘水位缓存（5s 一次）
+	pressureCheckedAt time.Time
+	pressureCached    bool
 }
 
 // NewSQLite 打开（必要时创建）一个 SQLite 缓冲。
@@ -57,7 +62,7 @@ func NewSQLite(path string, maxBytes int64, maxAge time.Duration) (*SQLite, erro
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 
-	s := &SQLite{db: db, maxBytes: maxBytes, maxAge: maxAge}
+	s := &SQLite{db: db, dbPath: path, maxBytes: maxBytes, maxAge: maxAge}
 	if err := s.init(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -123,6 +128,12 @@ func (s *SQLite) Append(events ...protocol.Event) (uint64, uint64, error) {
 	if len(events) == 0 {
 		return 0, 0, nil
 	}
+
+	// 磁盘水位 > 90% 拒绝写入并返回 ErrDiskPressure，由调用方上报 disk_pressure 事件
+	if s.diskPressure() {
+		return 0, 0, ErrDiskPressure
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -248,8 +259,8 @@ func (s *SQLite) Ack(toSeq uint64) error {
 	// 累计 dropped 已随本批上报，清零并持久化
 	if s.dropped > 0 {
 		if _, err := tx.ExecContext(ctx,
-			"INSERT INTO meta(key,value) VALUES('dropped_count',0) " +
-			"ON CONFLICT(key) DO UPDATE SET value=0"); err != nil {
+			"INSERT INTO meta(key,value) VALUES('dropped_count',0) "+
+				"ON CONFLICT(key) DO UPDATE SET value=0"); err != nil {
 			return fmt.Errorf("reset dropped: %w", err)
 		}
 	}
@@ -271,6 +282,26 @@ func (s *SQLite) Close() error {
 		return nil
 	}
 	return s.db.Close()
+}
+
+// diskPressure 检查缓冲文件所在卷的水位。
+// 超过 90% 返回 true；调用方应拒绝写入并上报 disk_pressure 事件。
+// 检查每 5s 缓存一次，避免每次 Append 都 statfs。
+func (s *SQLite) diskPressure() bool {
+	now := time.Now()
+	s.mu.Lock()
+	cached := s.pressureCheckedAt
+	cachedVal := s.pressureCached
+	s.mu.Unlock()
+	if now.Sub(cached) < 5*time.Second {
+		return cachedVal
+	}
+	ratio := diskUsedRatio(filepath.Dir(s.dbPath))
+	s.mu.Lock()
+	s.pressureCheckedAt = now
+	s.pressureCached = ratio > 0.90
+	s.mu.Unlock()
+	return ratio > 0.90
 }
 
 // enforceLimits 超限丢最旧并累加 dropped。
@@ -319,8 +350,8 @@ func (s *SQLite) enforceLimits(ctx context.Context) error {
 
 		if s.dropped > 0 {
 			if _, err := s.db.ExecContext(ctx,
-				"INSERT INTO meta(key,value) VALUES('dropped_count',?) " +
-				"ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+				"INSERT INTO meta(key,value) VALUES('dropped_count',?) "+
+					"ON CONFLICT(key) DO UPDATE SET value=excluded.value",
 				s.dropped); err != nil {
 				return fmt.Errorf("persist dropped: %w", err)
 			}

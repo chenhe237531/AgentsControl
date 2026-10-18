@@ -25,7 +25,7 @@ type Config struct {
 	// BufferKind: "sqlite"（默认，断电不丢）或 "memory"（仅测试用）
 	BufferKind string
 	// BufferPath: SQLite 文件路径；空则用 StatePath/buffer.db
-	BufferPath string
+	BufferPath     string
 	BufferMaxBytes int64
 	BufferMaxAge   time.Duration
 
