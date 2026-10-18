@@ -28,7 +28,7 @@ from app.core.errors import (
 from app.core.security import hash_device_token
 
 from .repository import DeviceRecord, DeviceRepository
-from .schemas import TRUST_VALUES, EventBatchIn, HeartbeatIn, RegisterIn
+from .schemas import TRUST_VALUES, EventBatchIn, HeartbeatIn, RegisterIn, SnapshotIn
 
 #: 引导码默认有效期（人工签发，一次性使用）
 BOOTSTRAP_CODE_TTL_DAYS = 7
@@ -360,3 +360,52 @@ class DeviceService:
         rows = await self._repo.list_events(node_id, since=since, limit=limit)
         next_since = max((r["seq"] for r in rows), default=since)
         return {"node_id": node_id, "since": since, "events": rows, "next_since": next_since}
+
+    # ------------------------------------------------------------- I05 快照与能力变更
+
+    async def ingest_snapshot(self, payload: SnapshotIn) -> dict:
+        """快照：保留最近 30 份；能力变化写 device_cap_events；收到即标记 woke_at。
+
+        唤醒容错：woke_at / last_snapshot_at 落库后，之后到达且 occurred_at 更早的
+        增量事件会被打 is_backfill 标（见 ingest_events），不打乱当前状态视图。
+        """
+        now = self._clock()
+        device = await self._require_device(payload.node)
+
+        snapshot_id = await self._repo.insert_snapshot(
+            payload.node,
+            ts=payload.ts,
+            versions=payload.versions.model_dump(),
+            sessions=[s.model_dump() for s in payload.sessions],
+            caps=list(payload.caps),
+            disk_used_gb=payload.disk_used_gb,
+            received_at=now,
+        )
+        prev_caps = set(device.caps or [])
+        new_caps = set(payload.caps)
+        added = sorted(new_caps - prev_caps)
+        removed = sorted(prev_caps - new_caps)
+        if added or removed:
+            await self._repo.insert_cap_event(payload.node, added=added, removed=removed)
+
+        await self._repo.update_device(
+            payload.node,
+            caps=list(payload.caps),
+            woke_at=now,
+            last_snapshot_at=now,
+            agent_version=payload.versions.agent or device.agent_version,
+        )
+        pruned = await self._repo.prune_snapshots(payload.node, keep=30)
+        await self._repo.commit()
+        return {
+            "snapshot_id": snapshot_id,
+            "caps_added": added,
+            "caps_removed": removed,
+            "pruned": pruned,
+            "woke_at": now,
+        }
+
+    async def list_snapshots(self, node_id: str, *, limit: int = 30) -> dict:
+        await self._require_device(node_id)
+        rows = await self._repo.list_snapshots(node_id, limit=limit)
+        return {"node_id": node_id, "snapshots": rows}

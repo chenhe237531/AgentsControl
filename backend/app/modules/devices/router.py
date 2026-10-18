@@ -30,6 +30,9 @@ from .schemas import (
     RegisterIn,
     RegisterOut,
     RevokeOut,
+    SnapshotIn,
+    SnapshotIngestOut,
+    SnapshotOut,
 )
 
 MODULE = "devices"
@@ -150,3 +153,30 @@ async def list_events(
     limit: int = Query(default=200, ge=1, le=500),
 ) -> EventsListOut:
     return EventsListOut(**await service.list_events(node_id, since=since, limit=limit))
+
+
+# ---------------------------------------------------------------------------
+# I05 · 快照（device HMAC 认证）
+# ---------------------------------------------------------------------------
+
+
+@router.post("/snapshot", response_model=SnapshotIngestOut, summary="快照上报（60min，唤醒先发）")
+async def ingest_snapshot(
+    payload: SnapshotIn,
+    service: DeviceServiceDep,
+    principal: device_hmac.DevicePrincipal = Depends(device_hmac.verify_device_signature),
+) -> SnapshotIngestOut:
+    if principal.node_id != payload.node:
+        raise ForbiddenError("快照与签名节点不一致")
+    return SnapshotIngestOut(**await service.ingest_snapshot(payload))
+
+
+@router.get("/{node_id}/snapshots", response_model=list[SnapshotOut], summary="快照历史（最近 N 份）")
+async def list_snapshots(
+    node_id: str,
+    _: OwnerDep,
+    service: DeviceServiceDep,
+    limit: int = Query(default=30, ge=1, le=30),
+) -> list[SnapshotOut]:
+    data = await service.list_snapshots(node_id, limit=limit)
+    return [SnapshotOut(**row) for row in data["snapshots"]]

@@ -255,3 +255,73 @@ class DeviceRepository:
             }
             for r in rows
         ]
+
+    # ------------------------------------------------------------- 快照与能力变更（I05）
+
+    async def insert_snapshot(
+        self,
+        node_id: str,
+        *,
+        ts: int,
+        versions: dict,
+        sessions: list[dict],
+        caps: list[str],
+        disk_used_gb: float,
+        received_at: datetime,
+    ) -> int:
+        row = models.DeviceSnapshot(
+            node_id=node_id,
+            ts=ts,
+            versions=versions,
+            sessions=sessions,
+            caps=caps,
+            disk_used_gb=disk_used_gb,
+            received_at=received_at,
+        )
+        self.session.add(row)
+        await self.session.flush()
+        return int(row.id)
+
+    async def prune_snapshots(self, node_id: str, *, keep: int = 30) -> int:
+        """只保留最近 keep 份，删最旧 —— 单条 SQL（子查询圈定要删的 id）。"""
+        from sqlalchemy import delete, select
+
+        subq = (
+            select(models.DeviceSnapshot.id)
+            .where(models.DeviceSnapshot.node_id == node_id)
+            .order_by(models.DeviceSnapshot.id.desc())
+            .offset(keep)
+            .scalar_subquery()
+        )
+        result = await self.session.execute(
+            delete(models.DeviceSnapshot).where(models.DeviceSnapshot.id.in_(subq))
+        )
+        return int(result.rowcount or 0)
+
+    async def insert_cap_event(self, node_id: str, *, added: list[str], removed: list[str]) -> None:
+        self.session.add(
+            models.DeviceCapEvent(node_id=node_id, added=added, removed=removed)
+        )
+        await self.session.flush()
+
+    async def list_snapshots(self, node_id: str, *, limit: int = 30) -> list[dict]:
+        stmt = (
+            select(models.DeviceSnapshot)
+            .where(models.DeviceSnapshot.node_id == node_id)
+            .order_by(models.DeviceSnapshot.id.desc())
+            .limit(limit)
+        )
+        rows = (await self.session.execute(stmt)).scalars().all()
+        return [
+            {
+                "id": r.id,
+                "node_id": r.node_id,
+                "ts": r.ts,
+                "versions": dict(r.versions or {}),
+                "sessions": list(r.sessions or []),
+                "caps": list(r.caps or []),
+                "disk_used_gb": r.disk_used_gb,
+                "received_at": r.received_at,
+            }
+            for r in rows
+        ]

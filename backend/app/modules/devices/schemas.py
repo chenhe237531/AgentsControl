@@ -217,3 +217,22 @@ class EventsListOut(BaseModel):
     since: int
     events: list[EventOut]
     next_since: int
+
+
+class SnapshotOut(BaseModel):
+    id: int
+    node_id: str
+    ts: int
+    versions: dict[str, Any]
+    sessions: list[dict[str, Any]]
+    caps: list[str]
+    disk_used_gb: float
+    received_at: datetime
+
+
+class SnapshotIngestOut(BaseModel):
+    snapshot_id: int
+    caps_added: list[str]
+    caps_removed: list[str]
+    pruned: int
+    woke_at: datetime

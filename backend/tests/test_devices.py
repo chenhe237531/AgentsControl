@@ -58,6 +58,9 @@ class FakeRepo:
         self.heartbeats: dict[str, dict] = {}
         self.alerts: list[dict] = []
         self.events: dict[tuple[str, int], dict] = {}
+        self.snapshots: dict[str, list[dict]] = {}
+        self.cap_events: dict[str, list[dict]] = {}
+        self.snap_seq = 0
 
     async def commit(self) -> None:
         return None
@@ -161,6 +164,49 @@ class FakeRepo:
             for (nid, seq), row in sorted(self.events.items())
             if nid == node_id and seq > since
         ]
+        return rows[:limit]
+
+    # ------------------------------------------------------------- 快照（I05）
+
+    async def insert_snapshot(
+        self,
+        node_id: str,
+        *,
+        ts: int,
+        versions: dict,
+        sessions: list[dict],
+        caps: list[str],
+        disk_used_gb: float,
+        received_at: datetime,
+    ) -> int:
+        self.snap_seq += 1
+        self.snapshots.setdefault(node_id, []).append(
+            {
+                "id": self.snap_seq,
+                "node_id": node_id,
+                "ts": ts,
+                "versions": dict(versions),
+                "sessions": [dict(s) for s in sessions],
+                "caps": list(caps),
+                "disk_used_gb": disk_used_gb,
+                "received_at": received_at,
+            }
+        )
+        return self.snap_seq
+
+    async def prune_snapshots(self, node_id: str, *, keep: int = 30) -> int:
+        rows = self.snapshots.get(node_id, [])
+        if len(rows) <= keep:
+            return 0
+        removed = rows[:-keep]
+        self.snapshots[node_id] = rows[-keep:]
+        return len(removed)
+
+    async def insert_cap_event(self, node_id: str, *, added: list[str], removed: list[str]) -> None:
+        self.cap_events.setdefault(node_id, []).append({"added": added, "removed": removed})
+
+    async def list_snapshots(self, node_id: str, *, limit: int = 30) -> list[dict]:
+        rows = list(reversed(self.snapshots.get(node_id, [])))
         return rows[:limit]
 
 
@@ -699,3 +745,92 @@ class TestEvents:
 
         # 设备游标（last_event_seq）随上报推进
         assert fake.repo.devices["mac-1"].last_event_seq == 3
+
+
+# =========================================================================
+# W04-I05 · 快照与能力变更
+# =========================================================================
+
+
+def post_snapshot(
+    client: TestClient,
+    fake: FakeState,
+    owner_headers,
+    node_id: str = "mac-1",
+    *,
+    token: str | None = None,
+    caps: list[str] | None = None,
+) -> dict:
+    if token is None:
+        token = register_device(client, fake, owner_headers, node_id)["token"]
+    payload = {
+        "node": node_id,
+        "ts": TS0,
+        "versions": {"agent": "0.1.0", "orca": "1.2", "skills": {"commit": "1.0"}},
+        "sessions": [{"id": "s-1", "task": "t-1", "state": "running", "worktree": "wt-1"}],
+        "caps": caps if caps is not None else ["gui", "orca"],
+        "disk_used_gb": 320.5,
+    }
+    r = device_post(client, f"{API}/snapshot", token, payload)
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+class TestSnapshot:
+    def test_snapshot_ingest_and_list(self, client: TestClient, fake: FakeState, owner_headers) -> None:
+        resp = post_snapshot(client, fake, owner_headers)
+        assert resp["snapshot_id"] == 1
+        assert resp["pruned"] == 0
+
+        record = fake.repo.devices["mac-1"]
+        assert record.woke_at == T0  # 收到快照即标记 woke_at
+        assert record.last_snapshot_at == T0
+        assert record.caps == ["gui", "orca"]
+
+        listed = client.get(f"{API}/mac-1/snapshots", headers=owner_headers).json()
+        assert len(listed) == 1
+        assert listed[0]["versions"]["agent"] == "0.1.0"
+        assert listed[0]["caps"] == ["gui", "orca"]
+
+    def test_retention_keeps_30(self, client: TestClient, fake: FakeState, owner_headers) -> None:
+        token = register_device(client, fake, owner_headers, "mac-1")["token"]
+        for _ in range(33):
+            post_snapshot(client, fake, owner_headers, token=token)
+        # 只保留最近 30 份，超限删最旧
+        assert len(fake.repo.snapshots["mac-1"]) == 30
+        ids = [s["id"] for s in fake.repo.snapshots["mac-1"]]
+        assert ids[0] == 4  # 最旧的 1-3 被删
+        assert ids[-1] == 33
+
+    def test_cap_change_writes_cap_events(self, client: TestClient, fake: FakeState, owner_headers) -> None:
+        token = register_device(client, fake, owner_headers, "mac-1")["token"]
+        post_snapshot(client, fake, owner_headers, token=token, caps=["gui", "orca"])
+        post_snapshot(client, fake, owner_headers, token=token, caps=["gui", "browser"])
+        events = fake.repo.cap_events["mac-1"]
+        # 第一次快照与注册时能力一致 → 不产生变更事件；第二次才有
+        assert len(events) == 1
+        assert events[0]["added"] == ["browser"]
+        assert events[0]["removed"] == ["orca"]
+        # 设备当前能力同步更新（W03 派活匹配读这里）
+        assert fake.repo.devices["mac-1"].caps == ["gui", "browser"]
+
+    def test_backfill_events_after_snapshot_are_flagged(self, client: TestClient, fake: FakeState, owner_headers) -> None:
+        """唤醒后先快照再增量：晚到但 occurred_at 更早的增量不打乱当前状态。"""
+        token = register_device(client, fake, owner_headers, "mac-1")["token"]
+        # 休眠前的事件（occurred_at 在快照之前）
+        stale = {"node": "mac-1", "from_seq": 1, "to_seq": 1,
+                 "events": [{"kind": "task_started", "occurred_at": TS0 - 3600}]}
+        r = device_post(client, f"{API}/events", token, stale)
+        assert r.status_code == 200
+
+        post_snapshot(client, fake, owner_headers, token=token)  # 唤醒，先发快照
+        late = {"node": "mac-1", "from_seq": 2, "to_seq": 2,
+                "events": [{"kind": "task_completed", "occurred_at": TS0 - 3500}]}
+        r = device_post(client, f"{API}/events", token, late)
+        assert r.status_code == 200
+
+        stored = sorted(fake.repo.events.values(), key=lambda e: e["seq"])
+        assert stored[0]["is_backfill"] is False  # 快照前的事件，无快照可比
+        assert stored[1]["is_backfill"] is True  # 快照之后到达但 occurred_at 更早 → 回填标
+        # 当前能力/快照视图不被早到的增量破坏
+        assert fake.repo.devices["mac-1"].last_snapshot_at is not None

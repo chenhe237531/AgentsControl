@@ -166,3 +166,42 @@ class DeviceEvent(Base):
                                               server_default="false")
 
     __table_args__ = (Index("ix_device_events_node_received", "node_id", "received_at"),)
+
+
+class DeviceSnapshot(Base):
+    """设备快照（60min 一次，唤醒后先发）：每节点保留最近 30 份，超限删最旧。"""
+
+    __tablename__ = "device_snapshots"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    node_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("devices.node_id", ondelete="CASCADE"), nullable=False
+    )
+    ts: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
+    versions: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict,
+                                           server_default=text("'{}'::jsonb"))
+    sessions: Mapped[list] = mapped_column(JSONB, nullable=False, default=list,
+                                           server_default=text("'[]'::jsonb"))
+    caps: Mapped[list] = mapped_column(JSONB, nullable=False, default=list,
+                                       server_default=text("'[]'::jsonb"))
+    disk_used_gb: Mapped[float] = mapped_column(Float, nullable=False, default=-1,
+                                                server_default="-1")
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False,
+                                                  server_default=func.now())
+
+    __table_args__ = (Index("ix_device_snapshots_node_id_desc", "node_id", "id"),)
+
+
+class DeviceCapEvent(Base):
+    """能力标签变更事件（W10 的"偏离"视图数据源）。"""
+
+    __tablename__ = "device_cap_events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    node_id: Mapped[str] = mapped_column(Text, nullable=False)
+    added: Mapped[list] = mapped_column(JSONB, nullable=False, default=list,
+                                        server_default=text("'[]'::jsonb"))
+    removed: Mapped[list] = mapped_column(JSONB, nullable=False, default=list,
+                                          server_default=text("'[]'::jsonb"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False,
+                                                 server_default=func.now())
