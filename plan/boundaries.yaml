@@ -1,0 +1,87 @@
+# 边界矩阵（人读视图）
+#
+# 权威来源：plan/windows.yaml 的 `allow`（窗口可写）与 `frozen`（禁改）。
+# 本文件只补充 windows.yaml 放不下的三件事：
+#   1) 跨窗口"只读依赖"：允许调用，不允许改
+#   2) 共享区：任何窗口都能改，但必须按规则改
+#   3) 热点文件的预约制
+# 冲突时以 windows.yaml 为准（check_boundaries.py 也只读它）。
+
+derived_from: plan/windows.yaml
+enforced_by: scripts/check_boundaries.py
+
+# ---------------------------------------------------------------------------
+# 共享区：不属于任何单一窗口，改动需谨慎但不需要 x-shared-registry
+# ---------------------------------------------------------------------------
+shared:
+  - path: docs/
+    rule: 每篇文档只有一个 owner 窗口；改别人的文档需要在该 PR 里说明原因
+  - path: plan/
+    rule: 只有 Merge Marshal 能在 Wave 边界改 windows.yaml；窗口只能改 plan/Wxx.md 的状态/PR 两列
+  - path: scripts/
+    rule: 新增脚本归发起窗口；修改已有脚本需在 PR 描述说明影响面
+  - path: .github/
+    rule: workflows 由 W09 独占；ISSUE/PR 模板由 Marshal 维护
+  - path: .fleet/
+    rule: handoff 只由本窗口写，覆盖式，≤10 行
+
+# ---------------------------------------------------------------------------
+# 跨窗口只读依赖：可以调，不能改
+# ---------------------------------------------------------------------------
+readonly_deps:
+  W02: [backend/app/modules/tasks/, backend/app/core/]
+  W03: [backend/app/modules/devices/, backend/app/modules/ledger/]
+  W04: [backend/app/core/security.py]
+  W05: [agent/internal/protocol/types.go, backend/app/modules/devices/]
+  W06: [backend/app/modules/tasks/, backend/app/modules/devices/]
+  W07: [backend/app/modules/tasks/, backend/app/modules/goals/, backend/app/modules/execution/]
+  W08: [backend/app/modules/execution/, backend/app/modules/ledger/]
+  W09: [backend/app/modules/tasks/, backend/app/modules/execution/, .github/workflows/ci.yml]
+  W10: [backend/app/modules/*, web/src/config/nav.ts]
+
+# ---------------------------------------------------------------------------
+# 热点文件：一次只允许一个窗口持有写锁（PR 评论 `lock: <name>` 预约）
+# ---------------------------------------------------------------------------
+hotspots:
+  - path: backend/app/core/
+    lock: core
+    owner: W01
+    reason: 9 个窗口的公共依赖，改一次全体重测
+  - path: backend/migrations/versions/
+    lock: migrations
+    owner: marshal
+    reason: 迁移必须单头；两个窗口同时建 head 必然分叉
+  - path: backend/app/api/router.py
+    lock: registry
+    owner: W01
+    reason: 集中注册点，10 个窗口的必然冲突点
+  - path: web/src/config/nav.ts
+    lock: nav
+    owner: W10
+    reason: 每个窗口都想加菜单项
+  - path: agent/internal/protocol/types.go
+    lock: device-protocol
+    owner: W04+W05
+    reason: 跨端契约，单边改动造成静默数据错乱
+  - path: .github/workflows/ci.yml
+    lock: ci
+    owner: W09
+    reason: 门禁定义，不能被单窗口放松
+  - path: backend/pyproject.toml
+    lock: deps-py
+    owner: W01
+    reason: 依赖变更影响全部后端窗口
+  - path: web/package.json
+    lock: deps-web
+    owner: W10
+    reason: 依赖变更影响构建产物与 CI 时长
+
+# ---------------------------------------------------------------------------
+# 命名与放置规则（防止"新建文件时随手放错目录"）
+# ---------------------------------------------------------------------------
+placement:
+  migrations: backend/migrations/versions/w<NN>_<seq>_<slug>.py   # 例 w03_01_tasks.py
+  tests: backend/tests/test_<module>.py                          # 一个模块一个文件，超过 400 行再拆
+  contracts: backend/app/modules/<module>/CONTRACT.md             # 只写本模块对外字段与错误码
+  scripts: scripts/<verb>-<object>.sh|py                          # 例 new-window.sh、check-boundaries.py
+  docs: docs/<TOPIC>-v<N>.md                                      # 版本化，不覆盖旧稿
