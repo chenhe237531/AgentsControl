@@ -11,12 +11,21 @@
 
 from __future__ import annotations
 
+import asyncio
 import secrets
 from datetime import UTC, datetime
 from pathlib import Path
 
-from app.core.errors import ConflictError, NotFoundError
+from app.core.errors import ConflictError, NotFoundError, UpstreamError
 
+from .orca import (
+    OrcaAdapter,
+    OrcaCommandError,
+    OrcaError,
+    OrcaFormatError,
+    OrcaSessionGone,
+    get_orca_status,
+)
 from .protocol import (
     CostBreakdown,
     TasksGateway,
@@ -30,7 +39,13 @@ from .protocol import (
     WorkerHeartbeatResponse,
 )
 from .repository import EventStore, SessionRow, SessionStore, WorkerInfo, WorkerStore
-from .schemas import SessionCreateRequest
+from .schemas import (
+    SessionCreateRequest,
+    SessionKillRequest,
+    SessionSendRequest,
+    SessionSpawnRequest,
+    SessionSteerRequest,
+)
 from .worktree import WorktreeExistsError, WorktreeManager, fleet_task_idem_key
 
 
@@ -51,6 +66,54 @@ class SessionNotFoundError(NotFoundError):
 class WorktreeDirtyError(ConflictError):
     code = "worktree_dirty"
     message = "worktree 有未提交改动，拒绝回收"
+
+
+class SessionNotRunnableError(ConflictError):
+    code = "session_not_runnable"
+    message = "会话当前状态不允许该操作"
+
+
+class OrcaUnavailableError(ConflictError):
+    code = "orca_unavailable"
+    message = "Orca 探测不可用，拒绝派 Orca 会话（不猜）"
+
+
+class SessionCrashedError(ConflictError):
+    code = "session_crashed"
+    message = "会话已崩溃：任务已转 failed（可重试）且租约已释放"
+
+
+class OrcaCommandFailedError(UpstreamError):
+    code = "orca_command_failed"
+    message = "Orca CLI 命令失败"
+
+
+# ---------------------------------------------------------------- 会话即租约（I04）
+# 会话存活期间由后台 keeper 周期续约，请求线程不承担长任务；
+# kill/崩溃/回收时统一走 stop_lease_keeper。
+
+LEASE_RENEW_SECONDS = 60.0
+
+_lease_keepers: dict[str, asyncio.Task[None]] = {}
+
+
+def stop_lease_keeper(session_id: str) -> None:
+    task = _lease_keepers.pop(session_id, None)
+    if task is not None:
+        task.cancel()
+
+
+def _start_lease_keeper(session_id: str, task_id: str, tasks: TasksGateway) -> None:
+    stop_lease_keeper(session_id)
+    _lease_keepers[session_id] = asyncio.create_task(
+        _lease_keep_loop(session_id, task_id, tasks)
+    )
+
+
+async def _lease_keep_loop(session_id: str, task_id: str, tasks: TasksGateway) -> None:
+    while True:
+        await asyncio.sleep(LEASE_RENEW_SECONDS)
+        await tasks.renew_lease(task_id, worker=session_id)
 
 
 class WorkerService:
@@ -183,7 +246,7 @@ class WorkerService:
 
 
 class SessionService:
-    """会话 = 租约 + worktree（W06-I03 起交付；spawn/kill/harvest 见后续 issue）。"""
+    """会话 = 租约 + worktree。I03 生命周期，I04 控制面四动作（spawn/send/steer/kill）。"""
 
     def __init__(
         self,
@@ -191,10 +254,14 @@ class SessionService:
         sessions: SessionStore,
         events: EventStore,
         worktrees: WorktreeManager,
+        tasks: TasksGateway,
+        orca: OrcaAdapter,
     ) -> None:
         self._sessions = sessions
         self._events = events
         self._worktrees = worktrees
+        self._tasks = tasks
+        self._orca = orca
 
     # ------------------------------------------------------------ 创建（I03）
 
@@ -273,6 +340,10 @@ class SessionService:
             raise SessionNotFoundError(f"会话不存在：{session_id}")
         if row.state == "recycled":
             return row
+        if row.state == "running":
+            raise SessionNotRunnableError(
+                f"会话 {session_id} 仍在 running，先 kill 再回收（避免撕毁运行中的会话）"
+            )
         if Path(row.worktree_path).exists():
             files = await self._worktrees.uncommitted_files(row.worktree_path)
             if files and not force:
@@ -290,3 +361,157 @@ class SessionService:
         )
         await self._sessions.commit()
         return updated or row
+
+    # ------------------------------------------------------------ 控制面四动作（I04）
+
+    async def spawn(self, session_id: str, req: SessionSpawnRequest) -> SessionRow:
+        """启动会话：probe 可用才派；成功即转 running 并挂上租约 keeper。
+
+        会话即租约：spawn 后 keeper 周期续约，长任务不回压请求线程——
+        过程细节一律靠事件表（session.spawned/message/steer/killed/failed）。
+        """
+        row = await self._sessions.get(session_id)
+        if row is None:
+            raise SessionNotFoundError(f"会话不存在：{session_id}")
+        if row.state != "created":
+            raise SessionNotRunnableError(
+                f"会话 {session_id} 状态为 {row.state}，只有 created 状态可 spawn"
+            )
+        if row.runtime != "orca":
+            raise SessionNotRunnableError(
+                "runtime=generic 会话由 Worker 协议驱动，不走控制面 spawn"
+            )
+        status = await get_orca_status()
+        if not status.available:
+            raise OrcaUnavailableError(
+                f"Orca 探测不可用（{status.error}），拒绝派 Orca 会话，不猜"
+            )
+        try:
+            orca_session = await self._orca.spawn(
+                worktree=row.worktree_path,
+                task_id=row.task_id,
+                prompt=req.prompt,
+                snapshot=req.snapshot,
+            )
+        except (OrcaCommandError, OrcaFormatError) as exc:
+            raise OrcaCommandFailedError(str(exc)) from exc
+        except OrcaError as exc:
+            raise OrcaUnavailableError(str(exc)) from exc
+        updated = await self._sessions.update(
+            session_id, state="running", orca_session=orca_session, spawned_at=_now()
+        )
+        await self._events.append(
+            task_id=row.task_id,
+            kind="session.spawned",
+            session_id=session_id,
+            payload={
+                "orca_session": orca_session,
+                "has_prompt": req.prompt is not None,
+                "snapshot": req.snapshot,
+            },
+        )
+        _start_lease_keeper(session_id, row.task_id, self._tasks)
+        await self._sessions.commit()
+        return updated or row
+
+    async def _control_target(self, session_id: str) -> SessionRow:
+        """send/steer 的前置条件：只有 running 的 Orca 会话可接收指令。"""
+        row = await self._sessions.get(session_id)
+        if row is None:
+            raise SessionNotFoundError(f"会话不存在：{session_id}")
+        if row.state != "running" or not row.orca_session:
+            raise SessionNotRunnableError(
+                f"会话 {session_id} 状态为 {row.state}，只有 running 会话可接收指令"
+            )
+        return row
+
+    async def _run_control(self, row: SessionRow, coro) -> SessionRow:
+        """执行 adapter 指令并翻译异常：会话消亡 → 崩溃路径；其他失败 → 502。"""
+        try:
+            await coro
+        except OrcaSessionGone as exc:
+            await self._mark_crashed(row, reason=str(exc))
+            raise SessionCrashedError(
+                f"会话 {row.id} 已崩溃：任务 {row.task_id} 已转 failed（retryable）且租约已释放"
+            ) from exc
+        except OrcaError as exc:
+            raise OrcaCommandFailedError(str(exc)) from exc
+        return row
+
+    async def send(self, session_id: str, req: SessionSendRequest) -> SessionRow:
+        row = await self._control_target(session_id)
+        row = await self._run_control(
+            row,
+            self._orca.send(session=row.orca_session, prompt=req.prompt, files=req.files),
+        )
+        await self._events.append(
+            task_id=row.task_id,
+            kind="session.message",
+            session_id=session_id,
+            payload={"chars": len(req.prompt), "files": list(req.files)},
+        )
+        await self._sessions.commit()
+        return row
+
+    async def steer(self, session_id: str, req: SessionSteerRequest) -> SessionRow:
+        """人工闸门/纠偏：只做生命周期级干预，绝不 inside-the-loop 指挥它怎么想。"""
+        row = await self._control_target(session_id)
+        row = await self._run_control(
+            row, self._orca.steer(session=row.orca_session, message=req.message)
+        )
+        await self._events.append(
+            task_id=row.task_id,
+            kind="session.steer",
+            session_id=session_id,
+            payload={"chars": len(req.message)},
+        )
+        await self._sessions.commit()
+        return row
+
+    async def kill(self, session_id: str, req: SessionKillRequest) -> SessionRow:
+        """终止会话并释放租约（kill 即释放）。幂等：终态会话直接返回。"""
+        row = await self._sessions.get(session_id)
+        if row is None:
+            raise SessionNotFoundError(f"会话不存在：{session_id}")
+        if row.state in ("killed", "failed", "recycled"):
+            return row
+        stop_lease_keeper(session_id)
+        if row.orca_session:
+            try:
+                await self._orca.kill(session=row.orca_session, mode=req.mode)
+            except OrcaSessionGone:
+                pass  # 已经死了：kill 幂等，继续收尾释放租约
+            except OrcaError as exc:
+                raise OrcaCommandFailedError(str(exc)) from exc
+        await self._tasks.release(row.task_id, worker=session_id)
+        updated = await self._sessions.update(session_id, state="killed", ended_at=_now())
+        await self._events.append(
+            task_id=row.task_id,
+            kind="session.killed",
+            session_id=session_id,
+            payload={"mode": req.mode},
+        )
+        await self._sessions.commit()
+        return updated or row
+
+    async def _mark_crashed(self, row: SessionRow, *, reason: str) -> None:
+        """会话崩溃：任务转 failed（retryable，交给调度面重派）+ 租约释放 + 状态收尾。"""
+        stop_lease_keeper(row.id)
+        await self._tasks.fail(
+            row.task_id,
+            worker=row.id,
+            error_type="session_crashed",
+            retryable=True,
+            context={"reason": reason[:500]},
+        )
+        await self._tasks.release(row.task_id, worker=row.id)
+        await self._sessions.update(
+            row.id, state="failed", error=reason[:500], ended_at=_now()
+        )
+        await self._events.append(
+            task_id=row.task_id,
+            kind="session.failed",
+            session_id=row.id,
+            payload={"reason": reason[:500], "retryable": True},
+        )
+        await self._sessions.commit()

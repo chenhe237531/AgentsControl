@@ -93,3 +93,42 @@ class SessionView(BaseModel):
     ended_at: datetime | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
+
+
+# ---------------------------------------------------------------- 会话控制（W06-I04）
+
+class SessionSpawnRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    prompt: str | None = Field(default=None, max_length=8000)
+    snapshot: str | None = Field(default=None, max_length=256)  # 断点续跑：从 snapshot 恢复
+
+
+class SessionSendRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    prompt: str = Field(min_length=1, max_length=8000)
+    files: list[str] = Field(default_factory=list, max_length=20)  # 附带的上下文文件
+
+
+class SessionSteerRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    message: str = Field(min_length=1, max_length=2000)
+
+
+class SessionKillRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    mode: Literal["graceful", "hard"] = "graceful"  # graceful = 先 snapshot 再杀
+
+
+class SessionAck(BaseModel):
+    """send/steer 的受理确认：过程细节靠事件表与会话视图，不在这里堆内容。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    session_id: str
+    task_id: str
+    state: str
+    accepted: bool = True

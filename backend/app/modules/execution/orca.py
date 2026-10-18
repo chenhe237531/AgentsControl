@@ -38,7 +38,11 @@ REFRESHER_ENABLED = True
 _VERSION_RE = re.compile(r"(\d+\.\d+(?:\.\d+)?[-\w.]*)")
 
 
-class OrcaFormatError(Exception):
+class OrcaError(Exception):
+    """Orca 适配层失败（消息已可读，service 层负责翻译成 HTTP 语义）。"""
+
+
+class OrcaFormatError(OrcaError):
     """Orca CLI 输出与约定格式不符（升级/换发行版时会触发）。"""
 
 
@@ -275,3 +279,109 @@ async def _refresh_loop() -> None:
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("orca 周期探测失败", extra={"err": str(exc)})
+
+
+# ---------------------------------------------------------------- 六原子动作（I04 起）
+
+SPAWN_TIMEOUT_SECONDS = 15.0
+SESSION_GONE_EXIT_CODE = 4  # 约定：会话不存在/已退出的退出码（adapter 吸收 CLI 方差）
+
+
+class OrcaCommandError(OrcaError):
+    """CLI 命令失败（非会话消亡的其他错误）。"""
+
+
+class OrcaSessionGone(OrcaError):
+    """会话不存在或已退出：调用方应把任务转 failed 并释放租约（重派）。"""
+
+
+def _looks_like_session_gone(result: RunnerResult) -> bool:
+    if result.rc == SESSION_GONE_EXIT_CODE:
+        return True
+    blob = f"{result.stdout}\n{result.stderr}"
+    return "session_not_found" in blob
+
+
+class OrcaAdapter:
+    """spawn/send/steer/kill 的 CLI 适配（harvest 见 harvest.py；probe 见上文）。
+
+    纪律：本类只做三件事——拼命令、解析 JSON、把失败翻译成语义化异常。
+    会话=租约、事件流等语义一律在 service 层。CLI 子命令形态以本适配层
+    为唯一绑定点，Orca 升级改这里，不改业务代码。
+    """
+
+    def __init__(self, runner: Runner, *, cli_name: str = "orca", which: Any = None) -> None:
+        self._runner = runner
+        self._cli_name = cli_name
+        self._which = which
+
+    def _resolve_cli(self) -> str:
+        resolve = self._which or shutil.which  # 运行时解析，测试可替换
+        path = resolve(self._cli_name)
+        if not path:
+            raise OrcaError(f"未找到 Orca CLI：PATH 中无 `{self._cli_name}`")
+        return path
+
+    async def spawn(
+        self,
+        *,
+        worktree: str,
+        task_id: str,
+        prompt: str | None = None,
+        snapshot: str | None = None,
+    ) -> str:
+        """启动会话：返回 Orca session_id。建目录失败 → OrcaCommandError（可重试）。"""
+        cli = self._resolve_cli()
+        args = [cli, "spawn", "--json", "--worktree", worktree, "--task", task_id]
+        if prompt:
+            args += ["--prompt", prompt]
+        if snapshot:
+            args += ["--snapshot", snapshot]
+        result = await self._runner.run(args, timeout=SPAWN_TIMEOUT_SECONDS)
+        if result.rc != 0:
+            raise OrcaCommandError(
+                f"`{self._cli_name} spawn` 失败（rc={result.rc}）：{result.stderr.strip()[:200]}"
+            )
+        try:
+            session_id = json.loads(result.stdout)["session_id"]
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            # 契约锚点：spawn 输出格式变化必须给出明确错误
+            raise OrcaFormatError(
+                "Orca CLI 输出格式变了：spawn 结果缺 session_id"
+                f"（stdout={result.stdout.strip()[:120]!r}）"
+            ) from exc
+        return str(session_id)
+
+    async def _control(self, args: list[str], *, action: str) -> None:
+        """send/steer/kill 共用：rc=0 受理；会话消亡与一般失败分开翻译。"""
+        result = await self._runner.run(args)
+        if result.rc == 0:
+            return
+        if _looks_like_session_gone(result):
+            raise OrcaSessionGone(
+                f"`{self._cli_name} {action}` 发现会话已不存在或已退出"
+                f"（rc={result.rc}）：{result.stderr.strip()[:160]}"
+            )
+        raise OrcaCommandError(
+            f"`{self._cli_name} {action}` 失败（rc={result.rc}）：{result.stderr.strip()[:200]}"
+        )
+
+    async def send(self, *, session: str, prompt: str, files: list[str] | None = None) -> None:
+        """向会话注入 prompt（附上下文文件）。会话不存在 → OrcaSessionGone（重派）。"""
+        cli = self._resolve_cli()
+        args = [cli, "send", "--json", "--session", session, "--prompt", prompt]
+        for path in files or []:
+            args += ["--file", path]
+        await self._control(args, action="send")
+
+    async def steer(self, *, session: str, message: str) -> None:
+        """人的干预指令（闸门/纠偏）：只做生命周期级干预，不指挥它怎么想。"""
+        cli = self._resolve_cli()
+        args = [cli, "steer", "--json", "--session", session, "--message", message]
+        await self._control(args, action="steer")
+
+    async def kill(self, *, session: str, mode: str = "graceful") -> None:
+        """终止会话。graceful = 先 snapshot 再杀（断点续跑依据）；hard = 直接杀。"""
+        cli = self._resolve_cli()
+        args = [cli, "kill", "--json", "--session", session, "--mode", mode]
+        await self._control(args, action="kill")

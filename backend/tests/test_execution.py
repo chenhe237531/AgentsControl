@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib
 import json
 import subprocess
+import time
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -23,6 +24,7 @@ from app.core.security import create_token
 from app.main import create_app
 from app.modules.execution import orca as exec_orca
 from app.modules.execution import protocol as proto
+from app.modules.execution import service as exec_service
 from app.modules.execution.protocol import LeasedTask
 from app.modules.execution.repository import EventRecord, SessionRow, WorkerInfo
 from app.modules.execution.worktree import (
@@ -937,3 +939,425 @@ class TestSessionLifecycle:
         assert r.status_code == 401
         r = sessions_client.delete("/api/v1/execution/sessions/s-1")
         assert r.status_code == 401
+
+
+# ================================================================ W06-I04 · 会话控制（spawn/send/steer/kill）
+
+def control_runner(**outputs) -> FakeOrcaRunner:
+    """默认健康的 Orca CLI 假体：spawn 返回 session_id，其余子命令 rc=0。"""
+    base: dict[str, exec_orca.RunnerResult] = {
+        "spawn": exec_orca.RunnerResult(rc=0, stdout='{"session_id": "os-777"}', stderr="")
+    }
+    base.update(outputs)
+    return FakeOrcaRunner(outputs=base)
+
+
+def control_client(
+    monkeypatch,
+    tmp_repo: Path,
+    sessions_store: FakeSessionStore,
+    events_store: FakeEventStore,
+    gateway: FakeTasksGateway,
+    runner: FakeOrcaRunner,
+    *,
+    available: bool = True,
+    which: str | None = "/bin/orca",
+) -> TestClient:
+    """I04 测试专用 App：probe 固定结果 + OrcaAdapter 挂假 CLI。"""
+    async def status(*, force=False):
+        return exec_orca.OrcaProbeResult(
+            available=available,
+            checked_at=utcnow(),
+            cli_path="/bin/orca" if available else None,
+            error=None if available else "未找到 Orca CLI：PATH 中无 `orca`，无法派 Orca 类任务",
+        )
+
+    monkeypatch.setattr(exec_service, "get_orca_status", status)
+    app = create_app()
+    app.dependency_overrides[exec_router.get_worker_store] = lambda: FakeWorkerStore()
+    app.dependency_overrides[exec_router.get_event_store] = lambda: events_store
+    app.dependency_overrides[exec_router.get_tasks_gateway] = lambda: gateway
+    app.dependency_overrides[exec_router.get_session_store] = lambda: sessions_store
+    app.dependency_overrides[exec_router.get_worktree_manager] = lambda: WorktreeManager(
+        tmp_repo
+    )
+    app.dependency_overrides[exec_router.get_orca_adapter] = lambda: exec_orca.OrcaAdapter(
+        runner, which=(lambda _: which)
+    )
+    return TestClient(app)
+
+
+def spawned_session(client: TestClient, **overrides) -> dict[str, Any]:
+    """建一个 runtime=orca 会话并 spawn 到 running；返回 spawn 后的视图。"""
+    created = client.post(
+        "/api/v1/execution/sessions",
+        headers=AUTH,
+        json=create_session_body(runtime="orca", **overrides),
+    )
+    assert created.status_code == 201
+    session_id = created.json()["id"]
+    r = client.post(
+        f"/api/v1/execution/sessions/{session_id}/spawn",
+        headers=AUTH,
+        json={"prompt": "build the feature"},
+    )
+    assert r.status_code == 200
+    assert r.json()["state"] == "running"
+    return r.json()
+
+
+class TestOrcaAdapter:
+    async def test_spawn_parses_session_id(self):
+        adapter = exec_orca.OrcaAdapter(control_runner(), which=lambda _: "/bin/orca")
+        sid = await adapter.spawn(worktree="/wt", task_id="T-1", prompt="go")
+        assert sid == "os-777"
+
+    async def test_spawn_format_change_raises_explicitly(self):
+        runner = control_runner(
+            spawn=exec_orca.RunnerResult(rc=0, stdout="garbage", stderr="")
+        )
+        adapter = exec_orca.OrcaAdapter(runner, which=lambda _: "/bin/orca")
+        with pytest.raises(exec_orca.OrcaFormatError, match="输出格式变了"):
+            await adapter.spawn(worktree="/wt", task_id="T-1")
+
+    async def test_spawn_command_failure(self):
+        runner = control_runner(
+            spawn=exec_orca.RunnerResult(rc=1, stdout="", stderr="boom")
+        )
+        adapter = exec_orca.OrcaAdapter(runner, which=lambda _: "/bin/orca")
+        with pytest.raises(exec_orca.OrcaCommandError):
+            await adapter.spawn(worktree="/wt", task_id="T-1")
+
+    async def test_send_translates_exit_code_as_session_gone(self):
+        runner = control_runner(
+            send=exec_orca.RunnerResult(rc=4, stdout="", stderr="no such session")
+        )
+        adapter = exec_orca.OrcaAdapter(runner, which=lambda _: "/bin/orca")
+        with pytest.raises(exec_orca.OrcaSessionGone):
+            await adapter.send(session="os-777", prompt="hi")
+
+    async def test_send_translates_error_payload_as_session_gone(self):
+        runner = control_runner(
+            send=exec_orca.RunnerResult(
+                rc=1, stdout='{"error": "session_not_found"}', stderr=""
+            )
+        )
+        adapter = exec_orca.OrcaAdapter(runner, which=lambda _: "/bin/orca")
+        with pytest.raises(exec_orca.OrcaSessionGone):
+            await adapter.send(session="os-777", prompt="hi")
+
+    async def test_send_generic_failure_is_command_error(self):
+        runner = control_runner(
+            send=exec_orca.RunnerResult(rc=1, stdout="", stderr="quota exceeded")
+        )
+        adapter = exec_orca.OrcaAdapter(runner, which=lambda _: "/bin/orca")
+        with pytest.raises(exec_orca.OrcaCommandError, match="quota exceeded"):
+            await adapter.send(session="os-777", prompt="hi")
+
+    async def test_kill_passes_mode(self):
+        runner = control_runner()
+        adapter = exec_orca.OrcaAdapter(runner, which=lambda _: "/bin/orca")
+        await adapter.kill(session="os-777", mode="hard")
+        assert ["hard" in a for a in runner.calls].count(True) == 1
+
+    async def test_missing_cli_raises(self):
+        adapter = exec_orca.OrcaAdapter(control_runner(), which=lambda _: None)
+        with pytest.raises(exec_orca.OrcaError, match="未找到 Orca CLI"):
+            await adapter.spawn(worktree="/wt", task_id="T-1")
+
+
+class TestSessionControl:
+    def test_spawn_marks_running_and_registers_orca_session(
+        self, monkeypatch, tmp_repo, sessions_store, events_store, gateway
+    ):
+        runner = control_runner()
+        c = control_client(
+            monkeypatch, tmp_repo, sessions_store, events_store, gateway, runner
+        )
+        created = c.post(
+            "/api/v1/execution/sessions",
+            headers=AUTH,
+            json=create_session_body(runtime="orca"),
+        ).json()
+        r = c.post(
+            f"/api/v1/execution/sessions/{created['id']}/spawn",
+            headers=AUTH,
+            json={"prompt": "build it", "snapshot": "snap-1"},
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["state"] == "running"
+        assert body["orca_session"] == "os-777"
+        assert body["spawned_at"]
+        # spawn 命令携带 worktree 与任务上下文
+        spawn_call = next(a for a in runner.calls if "spawn" in a)
+        assert created["worktree_path"] in spawn_call
+        assert created["task_id"] in spawn_call
+        assert "snap-1" in spawn_call
+        assert events_store.kinds("T-0412") == ["session.created", "session.spawned"]
+
+    def test_spawn_requires_orca_runtime(
+        self, monkeypatch, tmp_repo, sessions_store, events_store, gateway
+    ):
+        runner = control_runner()
+        c = control_client(
+            monkeypatch, tmp_repo, sessions_store, events_store, gateway, runner
+        )
+        created = c.post(
+            "/api/v1/execution/sessions",
+            headers=AUTH,
+            json=create_session_body(),  # runtime 缺省 generic
+        ).json()
+        r = c.post(
+            f"/api/v1/execution/sessions/{created['id']}/spawn",
+            headers=AUTH,
+            json={},
+        )
+        assert r.status_code == 409
+        assert r.json()["error"]["code"] == "session_not_runnable"
+        assert runner.calls == []  # 前置条件不满足时绝不碰 CLI
+
+    def test_spawn_blocked_when_probe_unavailable(
+        self, monkeypatch, tmp_repo, sessions_store, events_store, gateway
+    ):
+        """I02 验收延续：探测失败 → 拒绝派 Orca 任务，不猜。"""
+        runner = control_runner()
+        c = control_client(
+            monkeypatch, tmp_repo, sessions_store, events_store, gateway,
+            runner, available=False,
+        )
+        created = c.post(
+            "/api/v1/execution/sessions",
+            headers=AUTH,
+            json=create_session_body(runtime="orca"),
+        ).json()
+        r = c.post(
+            f"/api/v1/execution/sessions/{created['id']}/spawn", headers=AUTH, json={}
+        )
+        assert r.status_code == 409
+        assert r.json()["error"]["code"] == "orca_unavailable"
+        assert runner.calls == []
+
+    def test_spawn_missing_cli_between_probe_and_spawn(
+        self, monkeypatch, tmp_repo, sessions_store, events_store, gateway
+    ):
+        """TOCTOU：probe 说可用但 CLI 消失 → 明确 409，不 500。"""
+        runner = control_runner()
+        c = control_client(
+            monkeypatch, tmp_repo, sessions_store, events_store, gateway, runner,
+            which=None,
+        )
+        created = c.post(
+            "/api/v1/execution/sessions",
+            headers=AUTH,
+            json=create_session_body(runtime="orca"),
+        ).json()
+        r = c.post(
+            f"/api/v1/execution/sessions/{created['id']}/spawn", headers=AUTH, json={}
+        )
+        assert r.status_code == 409
+        assert r.json()["error"]["code"] == "orca_unavailable"
+
+    def test_spawn_rejects_non_created_state(
+        self, monkeypatch, tmp_repo, sessions_store, events_store, gateway
+    ):
+        c = control_client(
+            monkeypatch, tmp_repo, sessions_store, events_store, gateway, control_runner()
+        )
+        spawned_session(c)
+        session = next(iter(sessions_store.rows.values()))
+        r = c.post(
+            f"/api/v1/execution/sessions/{session.id}/spawn", headers=AUTH, json={}
+        )
+        assert r.status_code == 409
+        assert r.json()["error"]["code"] == "session_not_runnable"
+
+    def test_send_appends_message_event(
+        self, monkeypatch, tmp_repo, sessions_store, events_store, gateway
+    ):
+        c = control_client(
+            monkeypatch, tmp_repo, sessions_store, events_store, gateway, control_runner()
+        )
+        session = spawned_session(c)
+        r = c.post(
+            f"/api/v1/execution/sessions/{session['id']}/send",
+            headers=AUTH,
+            json={"prompt": "run the tests", "files": ["backend/tests/"]},
+        )
+        assert r.status_code == 200
+        assert r.json() == {
+            "session_id": session["id"],
+            "task_id": "T-0412",
+            "state": "running",
+            "accepted": True,
+        }
+        assert events_store.kinds("T-0412") == [
+            "session.created", "session.spawned", "session.message",
+        ]
+
+    def test_steer_appends_steer_event(
+        self, monkeypatch, tmp_repo, sessions_store, events_store, gateway
+    ):
+        c = control_client(
+            monkeypatch, tmp_repo, sessions_store, events_store, gateway, control_runner()
+        )
+        session = spawned_session(c)
+        r = c.post(
+            f"/api/v1/execution/sessions/{session['id']}/steer",
+            headers=AUTH,
+            json={"message": "注意预算上限，收敛范围"},
+        )
+        assert r.status_code == 200
+        assert events_store.kinds("T-0412")[-1] == "session.steer"
+
+    def test_send_on_dead_session_marks_task_failed_and_releases_lease(
+        self, monkeypatch, tmp_repo, sessions_store, events_store, gateway
+    ):
+        """I04 验收 ④：会话崩了 → 任务回 failed（可重派）且租约释放。"""
+        runner = control_runner(
+            send=exec_orca.RunnerResult(rc=4, stdout="", stderr="no such session")
+        )
+        c = control_client(
+            monkeypatch, tmp_repo, sessions_store, events_store, gateway, runner
+        )
+        session = spawned_session(c)
+        r = c.post(
+            f"/api/v1/execution/sessions/{session['id']}/send",
+            headers=AUTH,
+            json={"prompt": "hi"},
+        )
+        assert r.status_code == 409
+        assert r.json()["error"]["code"] == "session_crashed"
+        # 任务侧：failed + retryable（可重派），租约已释放
+        assert gateway.failed[0]["error_type"] == "session_crashed"
+        assert gateway.failed[0]["retryable"] is True
+        assert (session["task_id"], session["id"]) in gateway.released
+        # 会话侧：终态 + 原因 + 事件
+        assert sessions_store.rows[session["id"]].state == "failed"
+        assert "会话" in (sessions_store.rows[session["id"]].error or "")
+        assert events_store.kinds("T-0412")[-1] == "session.failed"
+        # 死会话不再接收指令
+        r2 = c.post(
+            f"/api/v1/execution/sessions/{session['id']}/send",
+            headers=AUTH,
+            json={"prompt": "again"},
+        )
+        assert r2.status_code == 409
+        assert r2.json()["error"]["code"] == "session_not_runnable"
+
+    def test_kill_releases_lease_and_marks_killed(
+        self, monkeypatch, tmp_repo, sessions_store, events_store, gateway
+    ):
+        runner = control_runner()
+        c = control_client(
+            monkeypatch, tmp_repo, sessions_store, events_store, gateway, runner
+        )
+        session = spawned_session(c)
+        r = c.post(
+            f"/api/v1/execution/sessions/{session['id']}/kill", headers=AUTH, json={}
+        )
+        assert r.status_code == 200
+        assert r.json()["state"] == "killed"
+        assert (session["task_id"], session["id"]) in gateway.released
+        kill_call = next(a for a in runner.calls if "kill" in a)
+        assert "graceful" in kill_call  # 缺省优雅停：先 snapshot 再杀
+        assert events_store.kinds("T-0412")[-1] == "session.killed"
+
+    def test_kill_is_idempotent(
+        self, monkeypatch, tmp_repo, sessions_store, events_store, gateway
+    ):
+        c = control_client(
+            monkeypatch, tmp_repo, sessions_store, events_store, gateway, control_runner()
+        )
+        session = spawned_session(c)
+        first = c.post(
+            f"/api/v1/execution/sessions/{session['id']}/kill", headers=AUTH, json={}
+        )
+        second = c.post(
+            f"/api/v1/execution/sessions/{session['id']}/kill", headers=AUTH, json={}
+        )
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert second.json()["state"] == "killed"
+        assert len(gateway.released) == 1  # 租约只释放一次
+
+    def test_kill_never_spawned_session_skips_cli(
+        self, monkeypatch, tmp_repo, sessions_store, events_store, gateway
+    ):
+        runner = control_runner()
+        c = control_client(
+            monkeypatch, tmp_repo, sessions_store, events_store, gateway, runner
+        )
+        created = c.post(
+            "/api/v1/execution/sessions",
+            headers=AUTH,
+            json=create_session_body(runtime="orca"),
+        ).json()
+        r = c.post(
+            f"/api/v1/execution/sessions/{created['id']}/kill", headers=AUTH, json={}
+        )
+        assert r.status_code == 200
+        assert r.json()["state"] == "killed"
+        assert runner.calls == []  # 没有 orca_session 就没有 CLI 调用
+        assert (created["task_id"], created["id"]) in gateway.released
+
+    def test_spawn_keeps_lease_alive_until_killed(
+        self, monkeypatch, tmp_repo, sessions_store, events_store, gateway
+    ):
+        """I04 验收 ②：会话即租约——存活期间自动续约，kill 即停。"""
+        monkeypatch.setattr(exec_service, "LEASE_RENEW_SECONDS", 0.02)
+        c = control_client(
+            monkeypatch, tmp_repo, sessions_store, events_store, gateway, control_runner()
+        )
+        with c:
+            session = spawned_session(c)
+            time.sleep(0.3)  # 主线程让路，portal 线程跑续约 keeper
+            renews = [(tid, worker) for tid, worker in gateway.renews]
+            assert len(renews) >= 2
+            assert all(tid == session["task_id"] for tid, _ in renews)
+            assert all(worker == session["id"] for _, worker in renews)
+
+            r = c.post(
+                f"/api/v1/execution/sessions/{session['id']}/kill",
+                headers=AUTH,
+                json={"mode": "hard"},
+            )
+            assert r.status_code == 200
+            stopped = len(gateway.renews)
+            time.sleep(0.1)
+            assert len(gateway.renews) == stopped  # kill 后不再续约
+
+    def test_recycle_refuses_running_session(
+        self, monkeypatch, tmp_repo, sessions_store, events_store, gateway
+    ):
+        c = control_client(
+            monkeypatch, tmp_repo, sessions_store, events_store, gateway, control_runner()
+        )
+        session = spawned_session(c)
+        r = c.delete(f"/api/v1/execution/sessions/{session['id']}", headers=AUTH)
+        assert r.status_code == 409
+        assert r.json()["error"]["code"] == "session_not_runnable"
+        # kill 之后即可回收
+        c.post(f"/api/v1/execution/sessions/{session['id']}/kill", headers=AUTH, json={})
+        r2 = c.delete(f"/api/v1/execution/sessions/{session['id']}", headers=AUTH)
+        assert r2.status_code == 200
+        assert r2.json()["state"] == "recycled"
+
+    def test_control_endpoints_require_auth(
+        self, monkeypatch, tmp_repo, sessions_store, events_store, gateway
+    ):
+        c = control_client(
+            monkeypatch, tmp_repo, sessions_store, events_store, gateway, control_runner()
+        )
+        assert (
+            c.post("/api/v1/execution/sessions/s-1/spawn", json={}).status_code == 401
+        )
+        assert (
+            c.post("/api/v1/execution/sessions/s-1/send", json={"prompt": "x"}).status_code
+            == 401
+        )
+        assert (
+            c.post("/api/v1/execution/sessions/s-1/steer", json={"message": "x"}).status_code
+            == 401
+        )
+        assert c.post("/api/v1/execution/sessions/s-1/kill", json={}).status_code == 401

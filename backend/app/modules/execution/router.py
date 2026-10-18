@@ -41,7 +41,16 @@ from app.modules.execution.repository import (
     SqlWorkerStore,
     WorkerStore,
 )
-from app.modules.execution.schemas import OrcaHealthView, SessionCreateRequest, SessionView
+from app.modules.execution.schemas import (
+    OrcaHealthView,
+    SessionAck,
+    SessionCreateRequest,
+    SessionKillRequest,
+    SessionSendRequest,
+    SessionSpawnRequest,
+    SessionSteerRequest,
+    SessionView,
+)
 
 MODULE = "execution"
 OWNER_WINDOW = "W06"
@@ -84,12 +93,20 @@ def get_worktree_manager() -> exec_worktree.WorktreeManager:
     return exec_worktree.default_manager()
 
 
+def get_orca_adapter() -> exec_orca.OrcaAdapter:
+    return exec_orca.OrcaAdapter(exec_orca.CliRunner())
+
+
 def get_session_service(
     sessions: Annotated[SessionStore, Depends(get_session_store)],
     events: Annotated[EventStore, Depends(get_event_store)],
     worktrees: Annotated[exec_worktree.WorktreeManager, Depends(get_worktree_manager)],
+    tasks: Annotated[proto.TasksGateway, Depends(get_tasks_gateway)],
+    orca: Annotated[exec_orca.OrcaAdapter, Depends(get_orca_adapter)],
 ) -> svc.SessionService:
-    return svc.SessionService(sessions=sessions, events=events, worktrees=worktrees)
+    return svc.SessionService(
+        sessions=sessions, events=events, worktrees=worktrees, tasks=tasks, orca=orca
+    )
 
 
 SessionServiceDep = Annotated[svc.SessionService, Depends(get_session_service)]
@@ -169,6 +186,68 @@ async def recycle_session(
     force: bool = False,
 ) -> SessionView:
     row = await service.recycle_session(session_id, force=force)
+    return _session_view(row)
+
+
+# ---------------------------------------------------------------- 会话控制（W06-I04）
+
+@router.post(
+    "/sessions/{session_id}/spawn",
+    summary="启动会话：probe 可用才派；成功转 running 并自动续租（会话即租约）",
+    response_model=SessionView,
+)
+async def spawn_session(
+    session_id: str,
+    body: SessionSpawnRequest,
+    _: OwnerDep,
+    service: SessionServiceDep,
+) -> SessionView:
+    row = await service.spawn(session_id, body)
+    return _session_view(row)
+
+
+@router.post(
+    "/sessions/{session_id}/send",
+    summary="向 running 会话注入 prompt（附上下文文件）；会话已死则任务转 failed 并释放租约",
+    response_model=SessionAck,
+)
+async def send_to_session(
+    session_id: str,
+    body: SessionSendRequest,
+    _: OwnerDep,
+    service: SessionServiceDep,
+) -> SessionAck:
+    row = await service.send(session_id, body)
+    return SessionAck(session_id=row.id, task_id=row.task_id, state=row.state)
+
+
+@router.post(
+    "/sessions/{session_id}/steer",
+    summary="人工干预（闸门/纠偏）：只做生命周期级指令，过程细节靠事件表",
+    response_model=SessionAck,
+)
+async def steer_session(
+    session_id: str,
+    body: SessionSteerRequest,
+    _: OwnerDep,
+    service: SessionServiceDep,
+) -> SessionAck:
+    row = await service.steer(session_id, body)
+    return SessionAck(session_id=row.id, task_id=row.task_id, state=row.state)
+
+
+@router.post(
+    "/sessions/{session_id}/kill",
+    summary="终止会话并释放租约（kill 即释放）；graceful 先 snapshot 再杀",
+    response_model=SessionView,
+)
+async def kill_session(
+    session_id: str,
+    body: SessionKillRequest,
+    _: OwnerDep,
+    service: SessionServiceDep,
+) -> SessionView:
+    row = await service.kill(session_id, body)
     return _session_view(row)
 
 
