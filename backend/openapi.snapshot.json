@@ -18,9 +18,9 @@
       "200"
     ]
   },
-  "GET /api/v1/auth/_ping": {
+  "GET /api/v1/auth/me": {
     "has_body": false,
-    "operation_id": "module_ping_api_v1_auth__ping_get",
+    "operation_id": "me_api_v1_auth_me_get",
     "params": [
       "header:authorization"
     ],
@@ -29,12 +29,15 @@
       "422"
     ]
   },
-  "GET /api/v1/auth/_status": {
+  "GET /api/v1/auth/scopes": {
     "has_body": false,
-    "operation_id": "module_status_api_v1_auth__status_get",
-    "params": [],
+    "operation_id": "scopes_api_v1_auth_scopes_get",
+    "params": [
+      "header:authorization"
+    ],
     "responses": [
-      "200"
+      "200",
+      "422"
     ]
   },
   "GET /api/v1/devices/_ping": {
@@ -290,6 +293,46 @@
     "params": [
       "header:authorization",
       "path:goal_id"
+    ],
+    "responses": [
+      "200",
+      "422"
+    ]
+  },
+  "POST /api/v1/auth/login": {
+    "has_body": true,
+    "operation_id": "login_api_v1_auth_login_post",
+    "params": [],
+    "responses": [
+      "200",
+      "422"
+    ]
+  },
+  "POST /api/v1/auth/logout": {
+    "has_body": false,
+    "operation_id": "logout_api_v1_auth_logout_post",
+    "params": [
+      "header:authorization"
+    ],
+    "responses": [
+      "200",
+      "422"
+    ]
+  },
+  "POST /api/v1/auth/refresh": {
+    "has_body": true,
+    "operation_id": "refresh_api_v1_auth_refresh_post",
+    "params": [],
+    "responses": [
+      "200",
+      "422"
+    ]
+  },
+  "POST /api/v1/auth/revoke-all": {
+    "has_body": false,
+    "operation_id": "revoke_all_api_v1_auth_revoke_all_post",
+    "params": [
+      "header:authorization"
     ],
     "responses": [
       "200",
