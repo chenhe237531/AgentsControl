@@ -189,3 +189,31 @@ class DeviceStatusOut(BaseModel):
     agent_version: str | None
     clock_skew_seconds: int | None
     last_event_seq: int
+
+
+class EventsIngestOut(BaseModel):
+    accepted: int
+    duplicates: int
+    rejected: int
+    from_seq: int
+    to_seq: int
+
+
+class EventOut(BaseModel):
+    seq: int
+    kind: str
+    task: str
+    model: str
+    cost: float
+    ms: int
+    extra: dict[str, Any]
+    occurred_at: int
+    received_at: datetime
+    is_backfill: bool
+
+
+class EventsListOut(BaseModel):
+    node_id: str
+    since: int
+    events: list[EventOut]
+    next_since: int

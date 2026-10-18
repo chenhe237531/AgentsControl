@@ -28,7 +28,7 @@ from app.core.errors import (
 from app.core.security import hash_device_token
 
 from .repository import DeviceRecord, DeviceRepository
-from .schemas import TRUST_VALUES, HeartbeatIn, RegisterIn
+from .schemas import TRUST_VALUES, EventBatchIn, HeartbeatIn, RegisterIn
 
 #: 引导码默认有效期（人工签发，一次性使用）
 BOOTSTRAP_CODE_TTL_DAYS = 7
@@ -38,6 +38,21 @@ CLOCK_SKEW_ALERT_SECONDS = 300
 ALERT_CLOCK_SKEW = "clock_skew"
 #: offline 触发租约回收的 kind（只发事件，不直接改 tasks 表 —— 那是 W03 的职责）
 ALERT_LEASE_RECLAIM = "lease_reclaim"
+#: 缓冲区丢弃告警的 kind（dropped_count > 0 必须上报，静默丢是红线）
+ALERT_BUFFER_DROPPED = "buffer_dropped"
+
+#: 增量事件 kind 白名单（未知 kind 拒收并计数，不报 4xx，避免设备端整体重传）
+EVENT_KINDS = (
+    "task_started",
+    "task_progress",
+    "task_completed",
+    "task_failed",
+    "session_started",
+    "session_ended",
+    "span",
+    "cost",
+    "error",
+)
 _ALLOWED_PATCH_FIELDS = ("caps", "tolerance", "squad", "purpose", "trust")
 
 
@@ -275,3 +290,73 @@ class DeviceService:
         if any(transitions.values()):
             await self._repo.commit()
         return {"checked": checked, "transitions": transitions}
+
+    # ------------------------------------------------------------- I04 增量事件
+
+    async def ingest_events(self, batch: EventBatchIn) -> dict:
+        """增量事件：幂等基础是 (node_id, seq) 唯一索引。
+
+        - 重复投递返回 200 且计入 duplicates，对客户端无害；
+        - 未知 kind 不入库、计入 rejected，仍返回 200（避免设备端整体重传）；
+        - dropped > 0 写告警表（静默丢是红线）。
+        """
+        if batch.to_seq < batch.from_seq + max(len(batch.events) - 1, 0):
+            raise ValidationError("to_seq 与事件数量不一致（dropped 只允许丢最旧）")
+
+        now = self._clock()
+        device = await self._require_device(batch.node)
+
+        accepted_rows: list[dict] = []
+        rejected = 0
+        whitelist = set(EVENT_KINDS)
+        for index, event in enumerate(batch.events):
+            if event.kind not in whitelist:
+                rejected += 1
+                continue
+            occurred = event.occurred_at or 0
+            backfill = bool(
+                occurred
+                and device.last_snapshot_at
+                and occurred < device.last_snapshot_at.timestamp()
+            )
+            accepted_rows.append(
+                {
+                    "node_id": batch.node,
+                    "seq": batch.seq_at(index),
+                    "kind": event.kind,
+                    "task": event.task,
+                    "model": event.model,
+                    "cost": event.cost,
+                    "ms": event.ms,
+                    "extra": event.extra,
+                    "occurred_at": occurred,
+                    "received_at": now,
+                    "is_backfill": backfill,
+                }
+            )
+
+        inserted = await self._repo.insert_events(accepted_rows) if accepted_rows else 0
+        duplicates = len(accepted_rows) - inserted
+
+        if batch.dropped > 0:
+            await self._repo.insert_alert(
+                batch.node,
+                ALERT_BUFFER_DROPPED,
+                {"dropped": batch.dropped, "from_seq": batch.from_seq, "to_seq": batch.to_seq},
+            )
+        if batch.to_seq > device.last_event_seq:
+            await self._repo.update_device(batch.node, last_event_seq=batch.to_seq)
+        await self._repo.commit()
+        return {
+            "accepted": inserted,
+            "duplicates": duplicates,
+            "rejected": rejected,
+            "from_seq": batch.from_seq,
+            "to_seq": batch.to_seq,
+        }
+
+    async def list_events(self, node_id: str, *, since: int = 0, limit: int = 200) -> dict:
+        await self._require_device(node_id)
+        rows = await self._repo.list_events(node_id, since=since, limit=limit)
+        next_since = max((r["seq"] for r in rows), default=since)
+        return {"node_id": node_id, "since": since, "events": rows, "next_since": next_since}

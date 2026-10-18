@@ -17,7 +17,19 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, String, Text, func, text
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    func,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -123,3 +135,34 @@ class DeviceAlert(Base):
                                          server_default=text("'{}'::jsonb"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False,
                                                  server_default=func.now())
+
+
+class DeviceEvent(Base):
+    """增量事件（追加日志）。
+
+    幂等基础：PRIMARY KEY (node_id, seq) —— 重复投递靠数据库唯一约束去重，
+    ON CONFLICT DO NOTHING，对客户端无害（返回 200 + duplicates 计数）。
+    seq 由批次 from_seq + 批内下标推导；occurred_at 只用于排序，时钟以 received_at 为准。
+    """
+
+    __tablename__ = "device_events"
+
+    node_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("devices.node_id", ondelete="CASCADE"), primary_key=True
+    )
+    seq: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    task: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
+    model: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
+    cost: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ms: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    extra: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict,
+                                        server_default=text("'{}'::jsonb"))
+    occurred_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False,
+                                                  server_default=func.now())
+    # 唤醒容错：occurred_at 早于最近一次快照的事件打回填标，不打乱当前状态视图
+    is_backfill: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False,
+                                              server_default="false")
+
+    __table_args__ = (Index("ix_device_events_node_received", "node_id", "received_at"),)

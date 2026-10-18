@@ -219,3 +219,39 @@ class DeviceRepository:
         )
         rows = (await self.session.execute(stmt)).scalars().all()
         return [_to_record(r) for r in rows]
+
+    # ------------------------------------------------------------- 增量事件（I04）
+
+    async def insert_events(self, rows: list[dict]) -> int:
+        """批量入库，UNIQUE(node_id, seq) 冲突即跳过（幂等），返回实际插入条数。"""
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        stmt = pg_insert(models.DeviceEvent).values(rows).on_conflict_do_nothing(
+            index_elements=["node_id", "seq"]
+        )
+        result = await self.session.execute(stmt)
+        return int(result.rowcount or 0)
+
+    async def list_events(self, node_id: str, *, since: int = 0, limit: int = 200) -> list[dict]:
+        stmt = (
+            select(models.DeviceEvent)
+            .where(models.DeviceEvent.node_id == node_id, models.DeviceEvent.seq > since)
+            .order_by(models.DeviceEvent.seq.asc())
+            .limit(limit)
+        )
+        rows = (await self.session.execute(stmt)).scalars().all()
+        return [
+            {
+                "seq": r.seq,
+                "kind": r.kind,
+                "task": r.task,
+                "model": r.model,
+                "cost": r.cost or 0.0,
+                "ms": r.ms or 0,
+                "extra": dict(r.extra or {}),
+                "occurred_at": r.occurred_at or 0,
+                "received_at": r.received_at,
+                "is_backfill": r.is_backfill,
+            }
+            for r in rows
+        ]

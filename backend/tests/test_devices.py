@@ -57,6 +57,7 @@ class FakeRepo:
         self.codes: dict[str, dict] = {}
         self.heartbeats: dict[str, dict] = {}
         self.alerts: list[dict] = []
+        self.events: dict[tuple[str, int], dict] = {}
 
     async def commit(self) -> None:
         return None
@@ -141,6 +142,26 @@ class FakeRepo:
             for r in self.devices.values()
             if r.last_seen_at is not None and r.status != "revoked"
         ]
+
+    # ------------------------------------------------------------- 增量事件（I04）
+
+    async def insert_events(self, rows: list[dict]) -> int:
+        inserted = 0
+        for row in rows:
+            key = (row["node_id"], row["seq"])
+            if key in self.events:
+                continue  # ON CONFLICT DO NOTHING
+            self.events[key] = dict(row)
+            inserted += 1
+        return inserted
+
+    async def list_events(self, node_id: str, *, since: int = 0, limit: int = 200) -> list[dict]:
+        rows = [
+            dict(row)
+            for (nid, seq), row in sorted(self.events.items())
+            if nid == node_id and seq > since
+        ]
+        return rows[:limit]
 
 
 class FakeState:
@@ -591,3 +612,90 @@ class TestHeartbeat:
     def test_status_endpoint_not_found(self, client: TestClient, fake: FakeState, owner_headers) -> None:
         r = client.get(f"{API}/ghost/status", headers=owner_headers)
         assert r.status_code == 404
+
+
+# =========================================================================
+# W04-I04 · 增量事件（幂等 + 游标）
+# =========================================================================
+
+
+def post_events(
+    client: TestClient,
+    fake: FakeState,
+    owner_headers,
+    node_id: str = "mac-1",
+    *,
+    token: str | None = None,
+    from_seq: int = 1,
+    kinds: list[str] | None = None,
+    dropped: int = 0,
+) -> dict:
+    if token is None:
+        token = register_device(client, fake, owner_headers, node_id)["token"]
+    kinds = kinds if kinds is not None else ["task_started", "task_completed"]
+    events = [
+        {"kind": k, "task": "t-1", "model": "glm-5", "cost": 0.01, "ms": 100,
+         "occurred_at": TS0 + i}
+        for i, k in enumerate(kinds)
+    ]
+    payload = {"node": node_id, "from_seq": from_seq,
+               "to_seq": from_seq + len(events) - 1, "events": events, "dropped": dropped}
+    r = device_post(client, f"{API}/events", token, payload)
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+class TestEvents:
+    def test_events_idempotent_same_batch_three_times(self, client: TestClient, fake: FakeState, owner_headers) -> None:
+        token = register_device(client, fake, owner_headers, "mac-1")["token"]
+        first = post_events(client, fake, owner_headers, token=token, from_seq=1)
+        assert first["accepted"] == 2 and first["duplicates"] == 0
+
+        # 同一批次重复投递 3 次：事件表行数不变，重复计入 duplicates 而非 409
+        for _ in range(3):
+            again = post_events(client, fake, owner_headers, token=token, from_seq=1)
+            assert again["accepted"] == 0
+            assert again["duplicates"] == 2
+        assert len(fake.repo.events) == 2  # 幂等对客户端无害
+
+    def test_unknown_kind_counted_and_accepted(self, client: TestClient, fake: FakeState, owner_headers) -> None:
+        resp = post_events(client, fake, owner_headers, kinds=["task_started", "boom_kind"])
+        assert resp["rejected"] == 1  # 未知 kind 拒收并计数，不报 4xx
+        assert resp["accepted"] == 1
+        kinds = [e["kind"] for e in fake.repo.events.values()]
+        assert "boom_kind" not in kinds
+
+    def test_dropped_count_writes_alert(self, client: TestClient, fake: FakeState, owner_headers) -> None:
+        post_events(client, fake, owner_headers, dropped=7)
+        assert any(
+            a["kind"] == "buffer_dropped" and a["detail"]["dropped"] == 7
+            for a in fake.repo.alerts
+        )
+
+    def test_batch_over_500_rejected(self, client: TestClient, fake: FakeState, owner_headers) -> None:
+        token = register_device(client, fake, owner_headers, "mac-1")["token"]
+        events = [{"kind": "span"} for _ in range(501)]
+        payload = {"node": "mac-1", "from_seq": 1, "to_seq": 501, "events": events}
+        r = device_post(client, f"{API}/events", token, payload)
+        assert r.status_code == 422
+
+    def test_node_mismatch_rejected(self, client: TestClient, fake: FakeState, owner_headers) -> None:
+        token = register_device(client, fake, owner_headers, "mac-1")["token"]
+        payload = {"node": "mac-2", "from_seq": 1, "to_seq": 1, "events": [{"kind": "span"}]}
+        r = device_post(client, f"{API}/events", token, payload, node="mac-1")
+        assert r.status_code == 403
+
+    def test_events_since_cursor(self, client: TestClient, fake: FakeState, owner_headers) -> None:
+        token = register_device(client, fake, owner_headers, "mac-1")["token"]
+        post_events(client, fake, owner_headers, token=token, from_seq=1, kinds=["task_started", "task_completed"])
+        post_events(client, fake, owner_headers, token=token, from_seq=3, kinds=["span"])
+
+        page1 = client.get(f"{API}/mac-1/events?since=0&limit=2", headers=owner_headers).json()
+        assert [e["seq"] for e in page1["events"]] == [1, 2]
+        assert page1["next_since"] == 2
+
+        page2 = client.get(f"{API}/mac-1/events?since=2", headers=owner_headers).json()
+        assert [e["seq"] for e in page2["events"]] == [3]
+
+        # 设备游标（last_event_seq）随上报推进
+        assert fake.repo.devices["mac-1"].last_event_seq == 3

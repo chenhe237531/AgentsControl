@@ -22,6 +22,9 @@ from .schemas import (
     DeviceOut,
     DevicePatchIn,
     DeviceStatusOut,
+    EventBatchIn,
+    EventsIngestOut,
+    EventsListOut,
     HeartbeatIn,
     HeartbeatOut,
     RegisterIn,
@@ -120,3 +123,30 @@ async def heartbeat(
 @router.get("/{node_id}/status", response_model=DeviceStatusOut, summary="设备状态（实时推导）")
 async def device_status(node_id: str, _: OwnerDep, service: DeviceServiceDep) -> DeviceStatusOut:
     return DeviceStatusOut(**await service.device_status(node_id))
+
+
+# ---------------------------------------------------------------------------
+# I04 · 增量事件（device HMAC 认证）
+# ---------------------------------------------------------------------------
+
+
+@router.post("/events", response_model=EventsIngestOut, summary="增量事件批量上报（30s，幂等）")
+async def ingest_events(
+    payload: EventBatchIn,
+    service: DeviceServiceDep,
+    principal: device_hmac.DevicePrincipal = Depends(device_hmac.verify_device_signature),
+) -> EventsIngestOut:
+    if principal.node_id != payload.node:
+        raise ForbiddenError("事件批次与签名节点不一致")
+    return EventsIngestOut(**await service.ingest_events(payload))
+
+
+@router.get("/{node_id}/events", response_model=EventsListOut, summary="按游标查询事件")
+async def list_events(
+    node_id: str,
+    _: OwnerDep,
+    service: DeviceServiceDep,
+    since: int = Query(default=0, ge=0),
+    limit: int = Query(default=200, ge=1, le=500),
+) -> EventsListOut:
+    return EventsListOut(**await service.list_events(node_id, since=since, limit=limit))
