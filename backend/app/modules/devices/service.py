@@ -28,10 +28,16 @@ from app.core.errors import (
 from app.core.security import hash_device_token
 
 from .repository import DeviceRecord, DeviceRepository
-from .schemas import TRUST_VALUES, RegisterIn
+from .schemas import TRUST_VALUES, HeartbeatIn, RegisterIn
 
 #: 引导码默认有效期（人工签发，一次性使用）
 BOOTSTRAP_CODE_TTL_DAYS = 7
+#: 设备时钟偏差告警阈值（秒）
+CLOCK_SKEW_ALERT_SECONDS = 300
+#: 时钟偏差告警的 kind
+ALERT_CLOCK_SKEW = "clock_skew"
+#: offline 触发租约回收的 kind（只发事件，不直接改 tasks 表 —— 那是 W03 的职责）
+ALERT_LEASE_RECLAIM = "lease_reclaim"
 _ALLOWED_PATCH_FIELDS = ("caps", "tolerance", "squad", "purpose", "trust")
 
 
@@ -162,3 +168,110 @@ class DeviceService:
     def _require_not_third_party(self, device: DeviceRecord, action: str) -> None:
         if device.trust == "third_party":
             raise ForbiddenError(f"第三方设备不接收{action}")
+
+    # ------------------------------------------------------------- I03 心跳与状态机
+
+    async def heartbeat(self, payload: HeartbeatIn) -> dict:
+        """心跳：UPSERT 单条 SQL + 状态回 online。时钟以服务端 received_at 为准。"""
+        now = self._clock()
+        device = await self._require_device(payload.node)
+        # third_party 设备可以上报数据，只是永不接收指令（I06 的下发/长轮询会 403）
+
+        skew = int(now.timestamp() - payload.ts)
+        if abs(skew) > CLOCK_SKEW_ALERT_SECONDS:
+            await self._repo.insert_alert(
+                payload.node,
+                ALERT_CLOCK_SKEW,
+                {"skew_seconds": skew, "device_ts": payload.ts, "seq": payload.seq},
+            )
+        await self._repo.upsert_heartbeat(
+            payload.node,
+            seq=payload.seq,
+            metrics={
+                "load": payload.load,
+                "mem": payload.mem,
+                "disk": payload.disk,
+                "battery": payload.battery,
+                "sessions": payload.sessions,
+                "queue": payload.queue,
+                "agent_ver": payload.agent_ver,
+            },
+            clock_skew_seconds=skew,
+            received_at=now,
+        )
+        # 恢复即回 online（哪怕之前是 suspect/offline）
+        await self._repo.update_device(
+            payload.node,
+            status="online",
+            missed_heartbeats=0,
+            last_seen_at=now,
+            agent_version=payload.agent_ver or device.agent_version,
+        )
+        await self._repo.commit()
+        return {
+            "node_id": payload.node,
+            "status": "online",
+            "received_at": now,
+            "clock_skew_seconds": skew,
+        }
+
+    async def device_status(self, node_id: str) -> dict:
+        device = await self._require_device(node_id)
+        hb = await self._repo.get_heartbeat(node_id)
+        effective, missed = self._effective_status(device, self._clock())
+        return {
+            "node_id": node_id,
+            "status": device.status,
+            "effective_status": effective,
+            "last_seen_at": device.last_seen_at,
+            "missed_heartbeats": missed,
+            "agent_version": device.agent_version,
+            "clock_skew_seconds": (hb or {}).get("clock_skew_seconds"),
+            "last_event_seq": device.last_event_seq,
+        }
+
+    def _effective_status(self, device: DeviceRecord, now: datetime) -> tuple[str, int]:
+        """按"现在"实时推导状态：不依赖 sweep 是否跑过（读时推导，写时落库）。
+
+        - 丢 3 次心跳（≈3 分钟没音讯）→ suspect，W03 读到 suspect 立即停止派新活；
+        - 丢 5 分钟（offline_after）→ offline，触发租约回收（只发事件）。
+        """
+        if device.status == "revoked":
+            return "revoked", 0
+        if device.last_seen_at is None:
+            return "offline", 0
+        idle = (now - device.last_seen_at).total_seconds()
+        missed = int(idle // 60)
+        if idle > device.tolerance and idle >= 300:
+            return "offline", missed
+        if missed >= 3:
+            return "suspect", missed
+        return "online", missed
+
+    async def sweep(self, *, now: datetime | None = None) -> dict:
+        """后台巡检：suspect(丢 3 次) → offline(丢 5 分钟)。
+
+        offline 触发租约回收只发 device_alerts 事件（kind=lease_reclaim），
+        不直接改 tasks 表 —— W03 订阅该事件后自行回收。
+        """
+        now = now or self._clock()
+        transitions = {"suspect": 0, "offline": 0}
+        checked = 0
+        for device in await self._repo.sweep_candidates():
+            checked += 1
+            effective, missed = self._effective_status(device, now)
+            if effective == device.status:
+                continue
+            if effective == "offline" and device.status != "offline":
+                transitions["offline"] += 1
+                await self._repo.insert_alert(
+                    device.node_id,
+                    ALERT_LEASE_RECLAIM,
+                    {"from_status": device.status, "last_seen_at": device.last_seen_at},
+                )
+            elif effective == "suspect":
+                transitions["suspect"] += 1
+            await self._repo.update_device(device.node_id, status=effective, missed_heartbeats=missed)
+        if any(transitions.values()):
+            await self._repo.commit()
+        return {"checked": checked, "transitions": transitions}

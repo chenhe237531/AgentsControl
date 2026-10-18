@@ -55,6 +55,8 @@ class FakeRepo:
     def __init__(self) -> None:
         self.devices: dict[str, DeviceRecord] = {}
         self.codes: dict[str, dict] = {}
+        self.heartbeats: dict[str, dict] = {}
+        self.alerts: list[dict] = []
 
     async def commit(self) -> None:
         return None
@@ -107,6 +109,38 @@ class FakeRepo:
         row["used_at"] = now
         row["used_by_node"] = node_id
         return True
+
+    # ------------------------------------------------------------- 心跳与状态机（I03）
+
+    async def upsert_heartbeat(
+        self,
+        node_id: str,
+        *,
+        seq: int,
+        metrics: dict,
+        clock_skew_seconds: int,
+        received_at: datetime,
+    ) -> None:
+        self.heartbeats[node_id] = {
+            "node_id": node_id,
+            "seq": seq,
+            "metrics": dict(metrics),
+            "clock_skew_seconds": clock_skew_seconds,
+            "received_at": received_at,
+        }
+
+    async def get_heartbeat(self, node_id: str) -> dict | None:
+        return self.heartbeats.get(node_id)
+
+    async def insert_alert(self, node_id: str, kind: str, detail: dict) -> None:
+        self.alerts.append({"node_id": node_id, "kind": kind, "detail": detail})
+
+    async def sweep_candidates(self) -> list[DeviceRecord]:
+        return [
+            r
+            for r in self.devices.values()
+            if r.last_seen_at is not None and r.status != "revoked"
+        ]
 
 
 class FakeState:
@@ -452,3 +486,108 @@ class TestHmac:
         payload = {"node": "api-ext", "ts": TS0, "seq": 1}
         principal = await self._verify(fake, payload, _signed_headers(body["token"], payload))
         assert principal.trust == "third_party"
+
+
+# =========================================================================
+# W04-I03 · 心跳与设备状态机
+# =========================================================================
+
+
+def send_heartbeat(
+    client: TestClient,
+    fake: FakeState,
+    owner_headers,
+    node_id: str = "mac-1",
+    *,
+    token: str | None = None,
+    **overrides,
+) -> dict:
+    """发一次心跳；token 为空时先注册。返回心跳响应。"""
+    if token is None:
+        token = register_device(client, fake, owner_headers, node_id)["token"]
+    payload = {"node": node_id, "ts": TS0, "seq": 1, "load": 0.4, "mem": 60, "disk": 70,
+               "battery": -1, "sessions": 2, "queue": 0, "agent_ver": "0.1.0"}
+    payload.update(overrides)
+    r = device_post(client, f"{API}/heartbeat", token, payload)
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def run_sweep(fake: FakeState) -> dict:
+    """在独立事件循环里跑一轮巡检（等价于 scripts/sweep_devices.py --once）。"""
+    import asyncio
+
+    return asyncio.run(fake.service.sweep())
+
+
+class TestHeartbeat:
+    def test_heartbeat_upserts_single_row(self, client: TestClient, fake: FakeState, owner_headers) -> None:
+        token = register_device(client, fake, owner_headers, "mac-1")["token"]
+        send_heartbeat(client, fake, owner_headers, token=token, seq=1)
+        send_heartbeat(client, fake, owner_headers, token=token, seq=2, load=0.9)
+        # UPSERT：一节点一行（不是追加日志）
+        assert len(fake.repo.heartbeats) == 1
+        hb = fake.repo.heartbeats["mac-1"]
+        assert hb["seq"] == 2
+        assert hb["metrics"]["load"] == 0.9
+
+        record = fake.repo.devices["mac-1"]
+        assert record.status == "online"
+        assert record.last_seen_at == T0
+        assert record.missed_heartbeats == 0
+        assert record.agent_version == "0.1.0"
+
+    def test_node_mismatch_rejected(self, client: TestClient, fake: FakeState, owner_headers) -> None:
+        body = register_device(client, fake, owner_headers, "mac-1")
+        payload = {"node": "mac-2", "ts": TS0, "seq": 1}  # 签名是 mac-1，内容冒充 mac-2
+        r = device_post(client, f"{API}/heartbeat", body["token"], payload, node="mac-1")
+        assert r.status_code == 403
+
+    def test_suspect_after_3_missed_heartbeats(self, client: TestClient, fake: FakeState, owner_headers) -> None:
+        send_heartbeat(client, fake, owner_headers)
+        # 丢 3 次（60s 间隔 × 3）→ suspect，必须立即停止派新活（W03 读 status）
+        fake.clock.advance(minutes=3)
+        result = run_sweep(fake)
+        assert result["transitions"]["suspect"] == 1
+        assert fake.repo.devices["mac-1"].status == "suspect"
+
+        status = client.get(f"{API}/mac-1/status", headers=owner_headers).json()
+        assert status["effective_status"] == "suspect"
+        assert status["missed_heartbeats"] == 3
+
+    def test_offline_after_5_minutes_emits_lease_reclaim(self, client: TestClient, fake: FakeState, owner_headers) -> None:
+        send_heartbeat(client, fake, owner_headers)
+        fake.clock.advance(minutes=6)  # 丢 5 分钟 → offline
+        result = run_sweep(fake)
+        assert result["transitions"]["offline"] == 1
+        record = fake.repo.devices["mac-1"]
+        assert record.status == "offline"
+
+        # 租约回收只发事件，不直接改 tasks 表
+        kinds = [a["kind"] for a in fake.repo.alerts]
+        assert "lease_reclaim" in kinds
+
+    def test_recovery_back_online(self, client: TestClient, fake: FakeState, owner_headers) -> None:
+        token = register_device(client, fake, owner_headers, "mac-1")["token"]
+        send_heartbeat(client, fake, owner_headers, token=token)
+        fake.clock.advance(minutes=3)
+        run_sweep(fake)
+        assert fake.repo.devices["mac-1"].status == "suspect"
+
+        # 心跳恢复 → 立即回 online，missed 归零
+        send_heartbeat(client, fake, owner_headers, token=token, seq=9)
+        record = fake.repo.devices["mac-1"]
+        assert record.status == "online"
+        assert record.missed_heartbeats == 0
+
+    def test_clock_skew_flagged_and_alerted(self, client: TestClient, fake: FakeState, owner_headers) -> None:
+        # 设备时钟慢了 10 分钟：服务端 received_at 为准，偏差打标 + 告警
+        resp = send_heartbeat(client, fake, owner_headers, ts=TS0 - 600)
+        assert resp["clock_skew_seconds"] == 600
+        assert any(a["kind"] == "clock_skew" for a in fake.repo.alerts)
+        hb = fake.repo.heartbeats["mac-1"]
+        assert hb["clock_skew_seconds"] == 600
+
+    def test_status_endpoint_not_found(self, client: TestClient, fake: FakeState, owner_headers) -> None:
+        r = client.get(f"{API}/ghost/status", headers=owner_headers)
+        assert r.status_code == 404

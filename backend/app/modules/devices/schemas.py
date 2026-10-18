@@ -166,3 +166,26 @@ class RevokeOut(BaseModel):
     node_id: str
     status: str
     revoked_at: datetime
+
+
+# =========================================================================
+# 3) 上报与指令（I03 / I04 / I05 / I06，随 issue 逐步补充）
+# =========================================================================
+
+
+class HeartbeatOut(BaseModel):
+    node_id: str
+    status: str
+    received_at: datetime
+    clock_skew_seconds: int
+
+
+class DeviceStatusOut(BaseModel):
+    node_id: str
+    status: str
+    effective_status: str
+    last_seen_at: datetime | None
+    missed_heartbeats: int
+    agent_version: str | None
+    clock_skew_seconds: int | None
+    last_event_seq: int

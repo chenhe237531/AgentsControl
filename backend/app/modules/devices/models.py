@@ -17,7 +17,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import BigInteger, DateTime, Integer, String, Text, func, text
+from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, String, Text, func, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -85,5 +85,41 @@ class DeviceBootstrapCode(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     used_by_node: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False,
+                                                 server_default=func.now())
+
+
+class DeviceHeartbeat(Base):
+    """心跳最新值（一节点一行，UPSERT 覆盖，不是追加日志 —— 行数不随时间膨胀）。"""
+
+    __tablename__ = "device_heartbeats"
+
+    node_id: Mapped[str] = mapped_column(
+        Text, ForeignKey("devices.node_id", ondelete="CASCADE"), primary_key=True
+    )
+    seq: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
+    # load/mem/disk/battery/sessions/queue/agent_ver（未知为 -1）
+    metrics: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict,
+                                          server_default=text("'{}'::jsonb"))
+    # 设备时钟与 received_at 的偏差（秒），>300 触发 clock_skew 告警
+    clock_skew_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=0,
+                                                    server_default="0")
+    received_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False,
+                                                  server_default=func.now())
+
+
+class DeviceAlert(Base):
+    """设备告警（只追加）：buffer_dropped / clock_skew / lease_reclaim。
+
+    offline 触发的租约回收也走这里（只发事件，不直接改 tasks 表）。
+    """
+
+    __tablename__ = "device_alerts"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    node_id: Mapped[str] = mapped_column(Text, nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    detail: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict,
+                                         server_default=text("'{}'::jsonb"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False,
                                                  server_default=func.now())

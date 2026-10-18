@@ -10,16 +10,20 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 
 from app.core.deps import OwnerDep
-from app.core.errors import ConflictError
+from app.core.errors import ConflictError, ForbiddenError
 
+from . import hmac as device_hmac
 from .deps import DeviceServiceDep
 from .schemas import (
     BootstrapCodeOut,
     DeviceOut,
     DevicePatchIn,
+    DeviceStatusOut,
+    HeartbeatIn,
+    HeartbeatOut,
     RegisterIn,
     RegisterOut,
     RevokeOut,
@@ -94,3 +98,25 @@ async def revoke_device(node_id: str, _: OwnerDep, service: DeviceServiceDep) ->
     if record.revoked_at is None:  # 理论不可达，防御类型检查
         raise ConflictError("吊销失败")
     return RevokeOut(node_id=record.node_id, status=record.status, revoked_at=record.revoked_at)
+
+
+# ---------------------------------------------------------------------------
+# I03 · 心跳（device HMAC 认证）
+# ---------------------------------------------------------------------------
+
+
+@router.post("/heartbeat", response_model=HeartbeatOut, summary="心跳上报（60s 一次）")
+async def heartbeat(
+    payload: HeartbeatIn,
+    service: DeviceServiceDep,
+    principal: device_hmac.DevicePrincipal = Depends(device_hmac.verify_device_signature),
+) -> HeartbeatOut:
+    if principal.node_id != payload.node:
+        raise ForbiddenError("心跳与签名节点不一致")
+    result = await service.heartbeat(payload)
+    return HeartbeatOut(**result)
+
+
+@router.get("/{node_id}/status", response_model=DeviceStatusOut, summary="设备状态（实时推导）")
+async def device_status(node_id: str, _: OwnerDep, service: DeviceServiceDep) -> DeviceStatusOut:
+    return DeviceStatusOut(**await service.device_status(node_id))

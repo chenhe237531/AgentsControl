@@ -161,3 +161,61 @@ class DeviceRepository:
         row.used_by_node = node_id
         await self.session.flush()
         return True
+
+    # ------------------------------------------------------------- 心跳与状态机（I03）
+
+    async def upsert_heartbeat(
+        self,
+        node_id: str,
+        *,
+        seq: int,
+        metrics: dict,
+        clock_skew_seconds: int,
+        received_at: datetime,
+    ) -> None:
+        """心跳 UPSERT 单条 SQL（PostgreSQL ON CONFLICT），一节点只保留最新一条。"""
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+        values = {
+            "node_id": node_id,
+            "seq": seq,
+            "metrics": metrics,
+            "clock_skew_seconds": clock_skew_seconds,
+            "received_at": received_at,
+        }
+        stmt = pg_insert(models.DeviceHeartbeat).values(**values).on_conflict_do_update(
+            index_elements=[models.DeviceHeartbeat.node_id],
+            set_={
+                "seq": seq,
+                "metrics": metrics,
+                "clock_skew_seconds": clock_skew_seconds,
+                "received_at": received_at,
+            },
+        )
+        await self.session.execute(stmt)
+
+    async def get_heartbeat(self, node_id: str) -> dict | None:
+        stmt = select(models.DeviceHeartbeat).where(models.DeviceHeartbeat.node_id == node_id)
+        row = (await self.session.execute(stmt)).scalar_one_or_none()
+        if row is None:
+            return None
+        return {
+            "node_id": row.node_id,
+            "seq": row.seq,
+            "metrics": dict(row.metrics or {}),
+            "clock_skew_seconds": row.clock_skew_seconds,
+            "received_at": row.received_at,
+        }
+
+    async def insert_alert(self, node_id: str, kind: str, detail: dict) -> None:
+        self.session.add(models.DeviceAlert(node_id=node_id, kind=kind, detail=detail))
+        await self.session.flush()
+
+    async def sweep_candidates(self) -> list[DeviceRecord]:
+        """需要巡检的设备：曾上线且未吊销。"""
+        stmt = select(models.Device).where(
+            models.Device.last_seen_at.is_not(None),
+            models.Device.status != "revoked",
+        )
+        rows = (await self.session.execute(stmt)).scalars().all()
+        return [_to_record(r) for r in rows]
