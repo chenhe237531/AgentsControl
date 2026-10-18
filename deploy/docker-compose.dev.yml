@@ -1,0 +1,28 @@
+version: "3.9"
+# 本地开发只起依赖（PG + Redis），API/Web 用本机进程跑，改代码即时热更。
+# 用法：docker compose -f deploy/docker-compose.dev.yml up -d
+name: afc-dev
+
+services:
+  db:
+    image: postgres:16-alpine
+    ports: ["5432:5432"]
+    environment:
+      POSTGRES_USER: afc
+      POSTGRES_PASSWORD: afc_dev_password
+      POSTGRES_DB: afc
+    volumes:
+      - afc_pgdata_dev:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U afc -d afc"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+
+volumes:
+  afc_pgdata_dev:

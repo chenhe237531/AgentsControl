@@ -1,0 +1,161 @@
+// afc-agent：设备端常驻进程。
+//
+// 进程模型（骨架）：
+//   - heartbeat 循环：60s，独立 goroutine；发送失败只记日志，不阻塞其它通道
+//   - flush 循环：30s 批量提交增量；先 Peek 再 Post，成功才 Ack（至少一次语义 + 服务端幂等）
+//   - snapshot 循环：60min；唤醒/启动时立即补一次（W05 实现"先快照后增量"）
+//
+// 退出：收到 SIGINT/SIGTERM 后停止领取新批次，给在途请求 5s 收尾，然后退出。
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"log/slog"
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/jackma3327/AgentsControl/agent/internal/buffer"
+	"github.com/jackma3327/AgentsControl/agent/internal/collect"
+	"github.com/jackma3327/AgentsControl/agent/internal/config"
+	"github.com/jackma3327/AgentsControl/agent/internal/protocol"
+	"github.com/jackma3327/AgentsControl/agent/internal/transport"
+)
+
+var (
+	version = "dev"
+	commit  = "none"
+)
+
+func main() {
+	showVersion := flag.Bool("version", false, "打印版本并退出")
+	flag.Parse()
+
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	slog.SetDefault(logger)
+
+	if *showVersion {
+		slog.Info("afc-agent", "version", version, "commit", commit)
+		return
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		slog.Error("config invalid", "err", err)
+		os.Exit(2) // 配置错误用独立退出码，便于服务管理器区分
+	}
+
+	buf := buffer.NewMemory(10_000)
+	client := transport.New(cfg.APIBaseURL, cfg.NodeID, cfg.Token)
+	collector := collect.New(cfg.NodeID, cfg.AgentVer)
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	slog.Info("agent started",
+		"node", cfg.NodeID, "api", cfg.APIBaseURL, "version", cfg.AgentVer,
+		"heartbeat", cfg.HeartbeatInterval.String(), "flush", cfg.FlushInterval.String(),
+		"caps", collector.Caps())
+
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() { defer wg.Done(); heartbeatLoop(ctx, cfg, collector, client) }()
+	go func() { defer wg.Done(); flushLoop(ctx, cfg, buf, client) }()
+	go func() { defer wg.Done(); snapshotLoop(ctx, cfg, collector, client) }()
+
+	<-ctx.Done()
+	slog.Info("shutdown signal received, draining")
+
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+		slog.Info("agent stopped cleanly")
+	case <-time.After(5 * time.Second):
+		slog.Warn("shutdown timeout, exiting with in-flight requests")
+	}
+}
+
+func heartbeatLoop(ctx context.Context, cfg *config.Config, c *collect.Collector, cl *transport.Client) {
+	ticker := time.NewTicker(cfg.HeartbeatInterval)
+	defer ticker.Stop()
+
+	send := func() {
+		hb := c.Heartbeat(0, 0, 0)
+		if err := cl.Post(ctx, "/devices/heartbeat", hb); err != nil {
+			slog.Warn("heartbeat failed", "err", err)
+			return
+		}
+		slog.Debug("heartbeat sent", "seq", hb.Seq)
+	}
+
+	send()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			send()
+		}
+	}
+}
+
+func flushLoop(ctx context.Context, cfg *config.Config, buf buffer.Buffer, cl *transport.Client) {
+	ticker := time.NewTicker(cfg.FlushInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			batch, err := buf.Peek(500)
+			if errors.Is(err, buffer.ErrEmpty) {
+				continue
+			}
+			if err != nil {
+				slog.Warn("peek failed", "err", err)
+				continue
+			}
+			batch.Node = cfg.NodeID
+			if err := cl.Post(ctx, "/devices/events", batch); err != nil {
+				// 不 Ack：下一轮原样重发，服务端按 (node,seq) 去重
+				slog.Warn("event flush failed", "from", batch.FromSeq, "to", batch.ToSeq, "err", err)
+				continue
+			}
+			if err := buf.Ack(batch.ToSeq); err != nil {
+				slog.Warn("ack failed", "err", err)
+			}
+		}
+	}
+}
+
+func snapshotLoop(ctx context.Context, cfg *config.Config, c *collect.Collector, cl *transport.Client) {
+	ticker := time.NewTicker(cfg.SnapshotInterval)
+	defer ticker.Stop()
+
+	send := func() {
+		snap := c.Snapshot(nil, "", -1)
+		if err := cl.Post(ctx, "/devices/snapshot", snap); err != nil {
+			slog.Warn("snapshot failed", "err", err)
+			return
+		}
+		slog.Info("snapshot sent")
+	}
+
+	send()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			send()
+		}
+	}
+}
+
+var _ = protocol.SchemaVersion

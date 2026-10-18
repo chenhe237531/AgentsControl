@@ -1,0 +1,536 @@
+version: 1
+# 机器可读的窗口与 issue 清单。
+# 这是「契约」不是「备注」：改动需走 shared-registry 变更请求，且只在 Wave 边界合并。
+# 校验：python scripts/check_boundaries.py
+# 进度：./scripts/window-status.sh
+#
+# 字段说明
+#   allow        本窗口唯一可写的路径（其余一律禁止）
+#   wave         合并波次（不是开发顺序；窗口可提前写，但按波次合并）
+#   commit       提交消息前缀，必须含 (#issue)
+#   depends_on   必须先合并的 issue（跨窗口依赖也在这里写）
+#   files        本 issue 主要改动的文件，用于冲突预判（不是硬约束）
+
+windows:
+  - id: W01
+    name: 身份、权限与工程内核
+    branch: win/w01-identity-kernel
+    worktree: .worktrees/w01-identity-kernel
+    labels: [priority/p0, priority/p1]
+    stage: T0-T2
+    allow:
+      - backend/app/core/
+      - backend/app/modules/identity/
+      - backend/tests/test_core_smoke.py
+      - backend/tests/test_identity.py
+      - backend/scripts/
+      - docs/adr/
+    frozen_readonly:
+      - backend/app/api/router.py
+      - web/src/config/nav.ts
+    issues:
+      - id: W01-I01
+        title: 登录与令牌轮换
+        wave: 1
+        commit: "feat(#<issue>): auth"
+        depends_on: []
+        files: [modules/identity/router.py, modules/identity/service.py, migrations/versions/w01_01_refresh_token.py]
+      - id: W01-I02
+        title: RBAC 与 scope 校验
+        wave: 2
+        commit: "feat(#<issue>): rbac"
+        depends_on: [W01-I01]
+        files: [modules/identity/rbac.py, backend/scripts/audit_scopes.py]
+      - id: W01-I03
+        title: 会话与设备吊销联动
+        wave: 3
+        commit: "feat(#<issue>): session-revoke"
+        depends_on: [W01-I01, W01-I02, W04-I02]
+        files: [modules/identity/service.py, migrations/versions/w01_02_auth_events.py]
+      - id: W01-I04
+        title: 速率限制与安全响应头加固
+        wave: 3
+        commit: "chore(#<issue>): hardening"
+        depends_on: [W01-I01]
+        files: [modules/identity/ratelimit.py]
+      - id: W01-I05
+        title: 工程内核补齐（错误码表与 OpenAPI 快照）
+        wave: 4
+        commit: "chore(#<issue>): kernel"
+        depends_on: []
+        files: [backend/scripts/gen_error_codes.py, docs/ERROR-CODES.md, docs/adr/0001-layering.md]
+
+  - id: W02
+    name: 收件箱与双轨目标
+    branch: win/w02-intake-goals
+    worktree: .worktrees/w02-intake-goals
+    labels: [priority/p0, priority/p1]
+    stage: P0
+    allow:
+      - backend/app/modules/intake/
+      - backend/app/modules/goals/
+      - backend/tests/test_intake.py
+      - backend/tests/test_goals.py
+    frozen_readonly:
+      - backend/app/core/
+    issues:
+      - id: W02-I01
+        title: Inbox 捕获
+        wave: 1
+        commit: "feat(#<issue>): intake-capture"
+        depends_on: []
+        files: [modules/intake/, migrations/versions/w02_01_intake.py]
+      - id: W02-I02
+        title: AI 三问结构化
+        wave: 2
+        commit: "feat(#<issue>): intake-structure"
+        depends_on: [W02-I01]
+        files: [modules/intake/service.py]
+      - id: W02-I03
+        title: 目标卡（双轨）
+        wave: 2
+        commit: "feat(#<issue>): goals-dual-track"
+        depends_on: [W02-I02]
+        files: [modules/goals/, migrations/versions/w02_02_goals.py]
+      - id: W02-I04
+        title: 模板库与止损判定
+        wave: 3
+        commit: "feat(#<issue>): goals-templates-stop-loss"
+        depends_on: [W02-I03]
+        files: [modules/goals/rules.py, modules/goals/templates.py]
+      - id: W02-I05
+        title: 兴趣池与自动归档
+        wave: 3
+        commit: "feat(#<issue>): interest-pool"
+        depends_on: [W02-I01, W02-I03]
+        files: [modules/intake/service.py, backend/scripts/archive_stale_intake.py]
+      - id: W02-I06
+        title: 目标看板聚合接口
+        wave: 4
+        commit: "feat(#<issue>): goals-summary"
+        depends_on: [W02-I03, W02-I04, W07-I01]
+        files: [modules/goals/service.py]
+
+  - id: W03
+    name: 任务队列与租约
+    branch: win/w03-task-queue
+    worktree: .worktrees/w03-task-queue
+    labels: [priority/p0, priority/p1]
+    stage: P1-P3
+    allow:
+      - backend/app/modules/tasks/
+      - backend/tests/test_tasks.py
+    frozen_readonly:
+      - backend/app/core/
+      - backend/app/modules/devices/
+    issues:
+      - id: W03-I01
+        title: 任务模型与状态机
+        wave: 1
+        commit: "feat(#<issue>): task-state-machine"
+        depends_on: []
+        files: [modules/tasks/machine.py, modules/tasks/models.py, migrations/versions/w03_01_tasks.py]
+      - id: W03-I02
+        title: 租约与心跳回收
+        wave: 2
+        commit: "feat(#<issue>): lease-reclaim"
+        depends_on: [W03-I01]
+        files: [modules/tasks/service.py, backend/scripts/reclaim_leases.py]
+      - id: W03-I03
+        title: 能力匹配与派活约束
+        wave: 2
+        commit: "feat(#<issue>): capability-match"
+        depends_on: [W03-I01, W04-I01]
+        files: [modules/tasks/matcher.py]
+      - id: W03-I04
+        title: 预算阀门
+        wave: 3
+        commit: "feat(#<issue>): budget-valve"
+        depends_on: [W03-I02, W07-I01]
+        files: [modules/tasks/valve.py]
+      - id: W03-I05
+        title: 优先级与公平调度
+        wave: 3
+        commit: "feat(#<issue>): scheduling-fairness"
+        depends_on: [W03-I02]
+        files: [modules/tasks/service.py]
+      - id: W03-I06
+        title: 死信与重试策略
+        wave: 4
+        commit: "feat(#<issue>): dead-letter"
+        depends_on: [W03-I02]
+        files: [modules/tasks/service.py, migrations/versions/w03_02_dead_letter.py]
+
+  - id: W04
+    name: 设备接入
+    branch: win/w04-device-ingest
+    worktree: .worktrees/w04-device-ingest
+    labels: [priority/p1]
+    stage: T1-T2
+    allow:
+      - backend/app/modules/devices/
+      - backend/tests/test_devices.py
+    frozen_readonly:
+      - agent/internal/protocol/types.go
+    issues:
+      - id: W04-I01
+        title: 设备注册与 token
+        wave: 1
+        commit: "feat(#<issue>): device-register"
+        depends_on: [W01-I01]
+        files: [modules/devices/models.py, migrations/versions/w04_01_devices.py]
+      - id: W04-I02
+        title: HMAC 验签中间件
+        wave: 2
+        commit: "feat(#<issue>): device-hmac"
+        depends_on: [W04-I01]
+        files: [modules/devices/hmac.py]
+      - id: W04-I03
+        title: 心跳与设备状态机
+        wave: 2
+        commit: "feat(#<issue>): heartbeat-state"
+        depends_on: [W04-I02]
+        files: [modules/devices/service.py, backend/scripts/sweep_devices.py]
+      - id: W04-I04
+        title: 增量事件（幂等 + 游标）
+        wave: 2
+        commit: "feat(#<issue>): event-ingest"
+        depends_on: [W04-I02]
+        files: [modules/devices/service.py, migrations/versions/w04_02_events.py]
+      - id: W04-I05
+        title: 快照与能力变更
+        wave: 3
+        commit: "feat(#<issue>): snapshot-caps"
+        depends_on: [W04-I02]
+        files: [modules/devices/service.py, migrations/versions/w04_03_snapshots.py]
+      - id: W04-I06
+        title: 指令下发白名单
+        wave: 4
+        commit: "feat(#<issue>): command-whitelist"
+        depends_on: [W04-I05]
+        files: [modules/devices/commands.py]
+
+  - id: W05
+    name: Go 设备 Agent
+    branch: win/w05-go-agent
+    worktree: .worktrees/w05-go-agent
+    labels: [priority/p1]
+    stage: T1-T2
+    allow:
+      - agent/
+      - deploy/agent/
+    co_owned:
+      - agent/internal/protocol/types.go
+    issues:
+      - id: W05-I01
+        title: 心跳与指标采集（macOS 优先）
+        wave: 1
+        commit: "feat(#<issue>): heartbeat-metrics"
+        depends_on: []
+        files: [agent/internal/collect/]
+      - id: W05-I02
+        title: SQLite 事件缓冲与游标续传
+        wave: 2
+        commit: "feat(#<issue>): sqlite-buffer"
+        depends_on: [W05-I01]
+        files: [agent/internal/buffer/sqlite.go, agent/go.mod]
+      - id: W05-I03
+        title: 服务安装（LaunchAgent/systemd/Windows Service）
+        wave: 3
+        commit: "feat(#<issue>): service-install"
+        depends_on: [W05-I01, W05-I02]
+        files: [agent/cmd/agent/, deploy/agent/]
+      - id: W05-I04
+        title: 快照与唤醒后先快照再增量
+        wave: 3
+        commit: "feat(#<issue>): snapshot-wake"
+        depends_on: [W05-I02]
+        files: [agent/internal/collect/, agent/cmd/agent/main.go]
+      - id: W05-I05
+        title: 打包发布（GoReleaser）
+        wave: 4
+        commit: "chore(#<issue>): goreleaser"
+        depends_on: [W05-I01, W05-I02, W05-I03, W05-I04]
+        files: [.goreleaser.yaml, .github/workflows/agent-release.yml]
+      - id: W05-I06
+        title: 断网与本地队列降级
+        wave: 4
+        commit: "feat(#<issue>): offline-mode"
+        depends_on: [W05-I02]
+        files: [agent/internal/buffer/, agent/internal/transport/]
+
+  - id: W06
+    name: 执行面（Worker 协议与 Orca）
+    branch: win/w06-execution
+    worktree: .worktrees/w06-execution
+    labels: [priority/p1, priority/p2]
+    stage: P1-T3
+    allow:
+      - backend/app/modules/execution/
+      - backend/tests/test_execution.py
+    frozen_readonly:
+      - backend/app/modules/tasks/
+    issues:
+      - id: W06-I01
+        title: Worker 协议（claim/heartbeat/complete/fail）
+        wave: 1
+        commit: "feat(#<issue>): worker-protocol"
+        depends_on: [W03-I01]
+        files: [modules/execution/protocol.py, migrations/versions/w06_01_workers.py]
+      - id: W06-I02
+        title: Orca probe 与能力自检
+        wave: 2
+        commit: "feat(#<issue>): orca-probe"
+        depends_on: [W06-I01]
+        files: [modules/execution/orca.py]
+      - id: W06-I03
+        title: worktree 生命周期与 .fleet-task.json
+        wave: 2
+        commit: "feat(#<issue>): worktree-lifecycle"
+        depends_on: [W06-I02]
+        files: [modules/execution/worktree.py]
+      - id: W06-I04
+        title: 会话 spawn/send/steer/kill
+        wave: 3
+        commit: "feat(#<issue>): session-control"
+        depends_on: [W06-I03]
+        files: [modules/execution/service.py]
+      - id: W06-I05
+        title: harvest：产物与 trace 归集
+        wave: 3
+        commit: "feat(#<issue>): harvest-trace"
+        depends_on: [W06-I04]
+        files: [modules/execution/harvest.py]
+      - id: W06-I06
+        title: 会话视图数据接口
+        wave: 4
+        commit: "feat(#<issue>): session-view-api"
+        depends_on: [W06-I05]
+        files: [modules/execution/router.py]
+
+  - id: W07
+    name: 账本、闸门与带宽熔断
+    branch: win/w07-ledger-approvals
+    worktree: .worktrees/w07-ledger-approvals
+    labels: [priority/p0, priority/p1]
+    stage: P0-P1
+    allow:
+      - backend/app/modules/ledger/
+      - backend/app/modules/approvals/
+      - backend/tests/test_ledger.py
+      - backend/tests/test_approvals.py
+    frozen_readonly:
+      - backend/app/core/
+    issues:
+      - id: W07-I01
+        title: 账本模型与成本归集
+        wave: 1
+        commit: "feat(#<issue>): ledger-model"
+        depends_on: []
+        files: [modules/ledger/models.py, migrations/versions/w07_01_ledger.py]
+      - id: W07-I02
+        title: 注意力账本（min/outcome）
+        wave: 2
+        commit: "feat(#<issue>): attention-ledger"
+        depends_on: [W07-I01, W02-I03]
+        files: [modules/ledger/attention.py]
+      - id: W07-I03
+        title: 闸门与决策分级
+        wave: 2
+        commit: "feat(#<issue>): approval-gates"
+        depends_on: []
+        files: [modules/approvals/, migrations/versions/w07_02_approvals.py]
+      - id: W07-I04
+        title: 带宽熔断
+        wave: 3
+        commit: "feat(#<issue>): bandwidth-breaker"
+        depends_on: [W07-I02, W07-I03]
+        files: [modules/approvals/breaker.py]
+      - id: W07-I05
+        title: 订阅摊销与配额消耗率
+        wave: 3
+        commit: "feat(#<issue>): subscription-amortization"
+        depends_on: [W07-I01]
+        files: [modules/ledger/amortize.py]
+      - id: W07-I06
+        title: 账本对账与导出
+        wave: 4
+        commit: "feat(#<issue>): ledger-reconcile"
+        depends_on: [W07-I01, W07-I05]
+        files: [modules/ledger/reconcile.py, backend/scripts/reconcile_ledger.py]
+
+  - id: W08
+    name: 资产面（模型雷达 / skill / 认知卡）
+    branch: win/w08-assets-radar
+    worktree: .worktrees/w08-assets-radar
+    labels: [priority/p2]
+    stage: P1-P2
+    allow:
+      - backend/app/modules/evals/
+      - backend/tests/test_evals.py
+    frozen_readonly:
+      - backend/app/core/
+    issues:
+      - id: W08-I01
+        title: 题库与运行框架
+        wave: 1
+        commit: "feat(#<issue>): eval-harness"
+        depends_on: []
+        files: [modules/evals/runner.py, migrations/versions/w08_01_evals.py]
+      - id: W08-I02
+        title: 8 维评分与雷达聚合
+        wave: 2
+        commit: "feat(#<issue>): radar-aggregate"
+        depends_on: [W08-I01]
+        files: [modules/evals/radar.py]
+      - id: W08-I03
+        title: 能力上限标记与立项校验
+        wave: 2
+        commit: "feat(#<issue>): capability-ceiling"
+        depends_on: [W08-I02]
+        files: [modules/evals/ceiling.py]
+      - id: W08-I04
+        title: 漂移预警
+        wave: 3
+        commit: "feat(#<issue>): model-drift"
+        depends_on: [W08-I02]
+        files: [modules/evals/drift.py, backend/scripts/check_drift.py]
+      - id: W08-I05
+        title: skill 与 harness 版本
+        wave: 3
+        commit: "feat(#<issue>): skill-registry"
+        depends_on: []
+        files: [modules/evals/skills.py, migrations/versions/w08_02_skills.py]
+      - id: W08-I06
+        title: 认知卡库
+        wave: 4
+        commit: "feat(#<issue>): cognition-cards"
+        depends_on: [W08-I05]
+        files: [modules/evals/cards.py, migrations/versions/w08_03_cards.py]
+
+  - id: W09
+    name: GitHub 验收总线与 CI 工具链
+    branch: win/w09-github-oracle
+    worktree: .worktrees/w09-github-oracle
+    labels: [priority/p1]
+    stage: T3
+    allow:
+      - backend/app/modules/github_sync/
+      - backend/tests/test_github.py
+      - backend/tests/fixtures/github/
+      - scripts/pr_precheck.sh
+      - scripts/openapi_snapshot.py
+      - scripts/check_boundaries.py
+      - .github/workflows/
+    issues:
+      - id: W09-I01
+        title: Webhook 接收与验签
+        wave: 1
+        commit: "feat(#<issue>): webhook-verify"
+        depends_on: []
+        files: [modules/github_sync/verify.py, migrations/versions/w09_01_github.py]
+      - id: W09-I02
+        title: PR 与 checks 状态同步
+        wave: 2
+        commit: "feat(#<issue>): pr-checks-sync"
+        depends_on: [W09-I01]
+        files: [modules/github_sync/service.py]
+      - id: W09-I03
+        title: Issue 镜像（仅单向）
+        wave: 2
+        commit: "feat(#<issue>): issue-mirror"
+        depends_on: [W09-I02]
+        files: [modules/github_sync/issues.py]
+      - id: W09-I04
+        title: 熔断与转人工
+        wave: 3
+        commit: "feat(#<issue>): ci-circuit-breaker"
+        depends_on: [W09-I02, W07-I03]
+        files: [modules/github_sync/breaker.py]
+      - id: W09-I05
+        title: 合并前预检脚本
+        wave: 1
+        commit: "chore(#<issue>): pr-precheck"
+        depends_on: []
+        files: [scripts/pr_precheck.sh, scripts/check_boundaries.py]
+      - id: W09-I06
+        title: CI 工作流整合与门禁
+        wave: 4
+        commit: "chore(#<issue>): ci-gates"
+        depends_on: [W09-I05]
+        files: [.github/workflows/ci.yml]
+
+  - id: W10
+    name: 前端控制台与可视化
+    branch: win/w10-console-ui
+    worktree: .worktrees/w10-console-ui
+    labels: [priority/p0, priority/p2]
+    stage: P0-T4
+    allow:
+      - web/
+    frozen_readonly:
+      - backend/app/
+    issues:
+      - id: W10-I01
+        title: 设计令牌与应用骨架收口
+        wave: 1
+        commit: "feat(#<issue>): design-tokens"
+        depends_on: []
+        files: [web/src/app/globals.css, web/src/components/ui/]
+      - id: W10-I02
+        title: 今日页
+        wave: 1
+        commit: "feat(#<issue>): today-page"
+        depends_on: [W07-I03, W07-I01]
+        files: [web/src/app/(console)/today/, web/src/features/today/]
+      - id: W10-I03
+        title: 收件箱与目标页
+        wave: 2
+        commit: "feat(#<issue>): inbox-goals-ui"
+        depends_on: [W02-I01, W02-I02, W02-I03]
+        files: [web/src/app/(console)/inbox/, web/src/app/(console)/goals/]
+      - id: W10-I04
+        title: 执行页与团队页
+        wave: 3
+        commit: "feat(#<issue>): execution-team-ui"
+        depends_on: [W06-I06, W04-I03]
+        files: [web/src/app/(console)/execution/, web/src/app/(console)/team/]
+      - id: W10-I05
+        title: 账本与兵工厂页
+        wave: 3
+        commit: "feat(#<issue>): ledger-arsenal-ui"
+        depends_on: [W07-I01, W07-I02, W08-I02]
+        files: [web/src/app/(console)/ledger/, web/src/app/(console)/arsenal/]
+      - id: W10-I06
+        title: 总视图与项目视图（React Flow）
+        wave: 4
+        commit: "feat(#<issue>): topology-views"
+        depends_on: [W03-I05, W06-I04]
+        files: [web/src/app/(console)/overview/, web/src/app/(console)/projects/]
+      - id: W10-I07
+        title: E2E 冒烟与可访问性
+        wave: 4
+        commit: "test(#<issue>): e2e-smoke"
+        depends_on: [W10-I01, W10-I02, W10-I03, W10-I04, W10-I05, W10-I06]
+        files: [web/e2e/]
+
+# 冻结文件：任何窗口改动需 label: x-shared-registry
+frozen:
+  - path: backend/app/api/router.py
+    reason: 10 个窗口的集中注册点，是 100% 冲突热点
+    owner: W01
+  - path: web/src/config/nav.ts
+    reason: 每个窗口都想加菜单项
+    owner: W10
+  - path: backend/app/core/
+    reason: 9 个窗口的公共依赖
+    owner: W01
+  - path: agent/internal/protocol/types.go
+    reason: 跨端契约，单边改动造成静默数据错乱
+    owner: W04+W05
+  - path: plan/windows.yaml
+    reason: 计划即契约
+    owner: marshal
+  - path: .github/workflows/ci.yml
+    reason: 门禁定义，不能被单窗口放松
+    owner: W09

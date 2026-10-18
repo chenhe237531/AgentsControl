@@ -1,0 +1,50 @@
+# --- 环境与密钥 ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# --- Node / Next ---
+node_modules/
+.next/
+out/
+.turbo/
+*.tsbuildinfo
+web/.env.local
+
+# --- Go ---
+agent/bin/
+agent/dist/
+*.test
+*.out
+
+# --- worktree（Issue 隔离目录，只存在于本地）---
+.worktrees/
+.fleet/local/
+.fleet/handoff/*.local.md
+
+# --- 会话记忆（本地工作记录，不参与协作，避免 10 个窗口互相冲突）---
+.workbuddy/
+
+# --- 运行时产物 ---
+*.log
+*.sqlite
+*.db
+data/
+coverage/
+.DS_Store
+.idea/
+.vscode/

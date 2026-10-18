@@ -1,0 +1,145 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  # 同一 PR 只保留最新一次运行，避免排队浪费额度
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.12"
+  NODE_VERSION: "22"
+  GO_VERSION: "1.23"
+
+jobs:
+  backend:
+    name: backend · lint + unit
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/pyproject.toml
+      - name: Install
+        run: pip install -e ".[dev]"
+      - name: Ruff
+        run: ruff check app tests
+      - name: Pytest
+        run: pytest -q
+
+  migrations:
+    name: backend · migrations
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: afc
+          POSTGRES_PASSWORD: afc
+          POSTGRES_DB: afc
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U afc" --health-interval 5s
+          --health-timeout 5s --health-retries 10
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      DATABASE_URL: postgresql+asyncpg://afc:afc@localhost:5432/afc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/pyproject.toml
+      - run: pip install -e ".[dev]"
+      - name: 单一 head 检查（防止多头）
+        run: |
+          heads=$(alembic heads | wc -l | tr -d ' ')
+          echo "heads=$heads"
+          test "$heads" = "1"
+      - name: upgrade → downgrade → upgrade（迁移必须可回滚）
+        run: |
+          alembic upgrade head
+          alembic downgrade base
+          alembic upgrade head
+
+  agent:
+    name: agent · go vet + build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: agent
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: agent/go.sum
+      - run: gofmt -l . | tee /tmp/fmt.txt && test ! -s /tmp/fmt.txt
+      - run: go vet ./...
+      - run: go test ./...
+      - run: go build ./...
+
+  web:
+    name: web · typecheck + build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install
+        run: |
+          # 有 lockfile 必须用 ci（确定性）；骨架期尚未提交 lockfile 时退化为 install
+          if [ -f package-lock.json ]; then
+            npm ci --no-audit --no-fund
+          else
+            echo "::warning::缺少 package-lock.json，暂用 npm install；W10 必须补交 lockfile"
+            npm install --no-audit --no-fund
+          fi
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Build
+        run: npm run build
+        env:
+          NEXT_PUBLIC_API_BASE_URL: http://localhost:8000/api/v1
+
+  secrets:
+    name: repo · secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: 禁止提交 .env 与私钥
+        run: |
+          set -e
+          bad=$(git ls-files | grep -E '(^|/)\.env$|\.pem$|\.p12$|id_rsa$' || true)
+          if [ -n "$bad" ]; then echo "发现疑似密钥文件："; echo "$bad"; exit 1; fi
+      - name: 禁止硬编码高风险字面量
+        run: |
+          set -e
+          if git grep -nE '(sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16})' -- . ':!*.md' ':!*.lock'; then
+            echo "疑似真实令牌被提交"; exit 1
+          fi

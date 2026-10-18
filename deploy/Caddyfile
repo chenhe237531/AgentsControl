@@ -1,0 +1,60 @@
+# Caddy 配置：自动 HTTPS + 同源反代。
+#
+# 拓扑（对应 TECH-ARCHITECTURE-v1 §1）：
+#   app.<域名>  → web (Next.js)
+#   api.<域名>  → api (FastAPI)，并把 /api/* 也接到 api，便于前端同源调用
+#
+# 生产必须把 {$APP_DOMAIN} / {$API_DOMAIN} 换成已备案域名；
+# 域名未备案/未解析前，Caddy 会自动改用本地自签证书（internal），
+# 所以本地 `docker compose up` 也能跑通 HTTPS 流程。
+
+{
+	# 只记错误，访问日志交给应用层的结构化日志，避免双写
+	log {
+		level ERROR
+	}
+	servers {
+		protocols h1 h2
+	}
+}
+
+{$APP_DOMAIN:app.pcxx.dev} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	# 前端同源调用 API：走 /api/*，避免小程序/浏览器跨域
+	handle /api/* {
+		reverse_proxy api:8000
+	}
+
+	handle /health {
+		reverse_proxy api:8000
+	}
+
+	handle {
+		reverse_proxy web:3000
+	}
+}
+
+{$API_DOMAIN:api.pcxx.dev} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		-Server
+	}
+
+	# 微信小程序 request 合法域名必须直接打到 api. 上
+	reverse_proxy api:8000 {
+		health_uri /health
+		health_interval 30s
+		health_timeout 3s
+	}
+}

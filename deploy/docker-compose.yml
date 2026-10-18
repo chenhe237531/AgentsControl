@@ -1,0 +1,113 @@
+# 单机部署：一台 4C8G 跑完 API + Web + PG + Redis + Caddy。
+# 用法：
+#   cp .env.example .env && 填写真实值
+#   docker compose -f deploy/docker-compose.yml --env-file .env up -d --build
+# 生产只用这一份文件；K8s 在单人或小团队场景下运维成本远超收益。
+name: agent-fleet-control
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-afc}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 必填}
+      POSTGRES_DB: ${POSTGRES_DB:-afc}
+      # 中文排序与大小写不敏感检索在后续窗口按需开启，不在此预设
+      TZ: Asia/Shanghai
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-afc} -d ${POSTGRES_DB:-afc}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging: *default-logging
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # 只做限流/缓存：给上限，避免 Redis 把单机内存吃光
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "512mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    logging: *default-logging
+
+  migrate:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    command: ["alembic", "upgrade", "head"]
+    env_file: [../.env]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-afc}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-afc}
+      DATABASE_URL_SYNC: postgresql+psycopg://${POSTGRES_USER:-afc}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-afc}
+    depends_on:
+      db: { condition: service_healthy }
+    restart: "no"
+    logging: *default-logging
+
+  api:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: [../.env]
+    environment:
+      APP_ENV: ${APP_ENV:-prod}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-afc}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-afc}
+      REDIS_URL: redis://redis:6379/0
+      GIT_SHA: ${GIT_SHA:-unknown}
+    depends_on:
+      db: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    expose: ["8000"]
+    read_only: true
+    tmpfs: ["/tmp"]
+    security_opt: ["no-new-privileges:true"]
+    logging: *default-logging
+
+  web:
+    build:
+      context: ../web
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:?前端 API 地址必填}
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+    expose: ["3000"]
+    depends_on: [api]
+    read_only: true
+    tmpfs: ["/tmp"]
+    security_opt: ["no-new-privileges:true"]
+    logging: *default-logging
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    environment:
+      APP_DOMAIN: ${APP_DOMAIN:?APP_DOMAIN 必填}
+      API_DOMAIN: ${API_DOMAIN:?API_DOMAIN 必填}
+      ACME_EMAIL: ${ACME_EMAIL:?ACME_EMAIL 必填}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on: [api, web]
+    logging: *default-logging
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:
