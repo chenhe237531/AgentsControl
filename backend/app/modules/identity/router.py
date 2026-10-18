@@ -1,23 +1,26 @@
 """身份与权限模块 —— owner: W01
 
-登录/刷新/登出、RBAC 判定、会话与令牌吊销；单用户白名单，不开放注册。
+单用户白名单系统，不开放注册。本文件只做 HTTP：解析入参、调 service、格式化响应，
+**不写业务逻辑**（规则在 `service.py`，SQL 在 `repository.py`）。
 
-分层约定（不可越界）：
-- `router.py`      只做 HTTP：解析入参、调用 service、格式化响应，**不写业务逻辑**
-- `service.py`     业务规则与编排，**不依赖 Request/Response**，多步写入走事务
-- `repository.py`  数据访问，只接受/返回领域对象或行记录
-- `models.py`      ORM 模型，继承 `app.core.db.Base`
-
-本文件是骨架占位：`/_status` 返回 501 供并行开发期自检。
-窗口实现时删除 `/_status`，并按 PLAN 中的端点清单逐个落地。
+端点：
+- `POST /auth/login`    邮箱 + 密码 → 访问令牌（15 min）+ 刷新令牌（14 天）
+- `POST /auth/refresh`  刷新并**轮换**刷新令牌（旧 token 立即失效，重放吊销整条会话）
+- `POST /auth/logout`   吊销当前会话的刷新令牌
+- `GET  /auth/me`       当前主体、角色与 scopes（W10 登录后首屏要用）
 """
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from typing import Annotated
+
+from fastapi import APIRouter, Header, Query, Request, Response, status
 
 from app.core.deps import OwnerDep
-from app.core.errors import NotImplementedYetError
+
+from .deps import ClaimsDep, IdentityServiceDep, client_ip_from_headers
+from .schemas import LoginRequest, LogoutRequest, MeResponse, RefreshRequest, TokenResponse
+from .service import TokenPair
 
 MODULE = "identity"
 OWNER_WINDOW = "W01"
@@ -25,11 +28,80 @@ OWNER_WINDOW = "W01"
 router = APIRouter(prefix="/auth", tags=["identity"])
 
 
-@router.get("/_status", summary="模块占位状态（骨架自检用）")
+def _token_response(pair: TokenPair) -> TokenResponse:
+    return TokenResponse(
+        access_token=pair.access_token,
+        refresh_token=pair.refresh_token,
+        expires_in=pair.access_expires_in,
+        refresh_expires_in=pair.refresh_expires_in,
+        session_id=pair.session_id,
+        subject=pair.subject,
+        role=pair.role,
+        scopes=list(pair.scopes),
+    )
+
+
+@router.post("/login", response_model=TokenResponse, summary="登录（失败 5 次/15 分钟限流）")
+async def login(
+    payload: LoginRequest,
+    request: Request,
+    service: IdentityServiceDep,
+    x_forwarded_for: Annotated[str | None, Header()] = None,
+    user_agent: Annotated[str | None, Header()] = None,
+) -> TokenResponse:
+    pair = await service.login(
+        payload.email,
+        payload.password,
+        client_ip=client_ip_from_headers(
+            x_forwarded_for, request.client.host if request.client else None
+        ),
+        user_agent=user_agent,
+    )
+    return _token_response(pair)
+
+
+@router.post("/refresh", response_model=TokenResponse, summary="刷新访问令牌（轮换刷新令牌）")
+async def refresh(payload: RefreshRequest, service: IdentityServiceDep) -> TokenResponse:
+    return _token_response(await service.refresh(payload.refresh_token))
+
+
+@router.post(
+    "/logout",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="登出（吊销当前会话的刷新令牌）",
+)
+async def logout(
+    principal: OwnerDep,
+    claims: ClaimsDep,
+    service: IdentityServiceDep,
+    payload: LogoutRequest | None = None,
+    session_id: Annotated[
+        str | None, Query(description="显式指定会话（「吊销全部会话」见 W01-I03）")
+    ] = None,
+) -> Response:
+    await service.logout(
+        session_id=session_id or str(claims.get("sid") or "") or None,
+        refresh_token=payload.refresh_token if payload else None,
+    )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get("/me", response_model=MeResponse, summary="当前主体、角色与 scopes")
+async def me(principal: OwnerDep, claims: ClaimsDep) -> MeResponse:
+    return MeResponse(
+        subject=principal.subject,
+        role=principal.role,
+        scopes=list(principal.scopes),
+        email=(claims.get("email") or None),
+        session_id=(claims.get("sid") or None),
+    )
+
+
+@router.get("/_status", summary="模块状态（骨架自检用）")
 async def module_status() -> dict[str, str]:
-    return {"module": MODULE, "owner_window": OWNER_WINDOW, "state": "stub"}
+    return {"module": MODULE, "owner_window": OWNER_WINDOW, "state": "implemented"}
 
 
-@router.get("/_ping", summary="需要认证的占位端点（验证认证链路）")
-async def module_ping(_: OwnerDep) -> dict[str, str]:
-    raise NotImplementedYetError(f"模块 {MODULE} 尚未实现，owner={OWNER_WINDOW}")
+@router.get("/_ping", summary="需要认证的探针（验证认证链路）")
+async def module_ping(principal: OwnerDep) -> dict[str, str]:
+    return {"module": MODULE, "subject": principal.subject}
