@@ -21,7 +21,8 @@ windows:
     allow:
       - backend/app/core/
       - backend/app/modules/identity/
-      - backend/tests/test_core_smoke.py
+      - backend/tests/test_smoke.py
+      - backend/tests/test_core.py
       - backend/tests/test_identity.py
       - backend/scripts/
       - docs/adr/

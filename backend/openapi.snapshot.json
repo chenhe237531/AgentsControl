@@ -1,0 +1,216 @@
+{
+  "GET /api/v1/approvals/_ping": {
+    "has_body": false,
+    "operation_id": "module_ping_api_v1_approvals__ping_get",
+    "params": [
+      "header:authorization"
+    ],
+    "responses": [
+      "200",
+      "422"
+    ]
+  },
+  "GET /api/v1/approvals/_status": {
+    "has_body": false,
+    "operation_id": "module_status_api_v1_approvals__status_get",
+    "params": [],
+    "responses": [
+      "200"
+    ]
+  },
+  "GET /api/v1/auth/_ping": {
+    "has_body": false,
+    "operation_id": "module_ping_api_v1_auth__ping_get",
+    "params": [
+      "header:authorization"
+    ],
+    "responses": [
+      "200",
+      "422"
+    ]
+  },
+  "GET /api/v1/auth/_status": {
+    "has_body": false,
+    "operation_id": "module_status_api_v1_auth__status_get",
+    "params": [],
+    "responses": [
+      "200"
+    ]
+  },
+  "GET /api/v1/devices/_ping": {
+    "has_body": false,
+    "operation_id": "module_ping_api_v1_devices__ping_get",
+    "params": [
+      "header:authorization"
+    ],
+    "responses": [
+      "200",
+      "422"
+    ]
+  },
+  "GET /api/v1/devices/_status": {
+    "has_body": false,
+    "operation_id": "module_status_api_v1_devices__status_get",
+    "params": [],
+    "responses": [
+      "200"
+    ]
+  },
+  "GET /api/v1/evals/_ping": {
+    "has_body": false,
+    "operation_id": "module_ping_api_v1_evals__ping_get",
+    "params": [
+      "header:authorization"
+    ],
+    "responses": [
+      "200",
+      "422"
+    ]
+  },
+  "GET /api/v1/evals/_status": {
+    "has_body": false,
+    "operation_id": "module_status_api_v1_evals__status_get",
+    "params": [],
+    "responses": [
+      "200"
+    ]
+  },
+  "GET /api/v1/execution/_ping": {
+    "has_body": false,
+    "operation_id": "module_ping_api_v1_execution__ping_get",
+    "params": [
+      "header:authorization"
+    ],
+    "responses": [
+      "200",
+      "422"
+    ]
+  },
+  "GET /api/v1/execution/_status": {
+    "has_body": false,
+    "operation_id": "module_status_api_v1_execution__status_get",
+    "params": [],
+    "responses": [
+      "200"
+    ]
+  },
+  "GET /api/v1/github/_ping": {
+    "has_body": false,
+    "operation_id": "module_ping_api_v1_github__ping_get",
+    "params": [
+      "header:authorization"
+    ],
+    "responses": [
+      "200",
+      "422"
+    ]
+  },
+  "GET /api/v1/github/_status": {
+    "has_body": false,
+    "operation_id": "module_status_api_v1_github__status_get",
+    "params": [],
+    "responses": [
+      "200"
+    ]
+  },
+  "GET /api/v1/goals/_ping": {
+    "has_body": false,
+    "operation_id": "module_ping_api_v1_goals__ping_get",
+    "params": [
+      "header:authorization"
+    ],
+    "responses": [
+      "200",
+      "422"
+    ]
+  },
+  "GET /api/v1/goals/_status": {
+    "has_body": false,
+    "operation_id": "module_status_api_v1_goals__status_get",
+    "params": [],
+    "responses": [
+      "200"
+    ]
+  },
+  "GET /api/v1/intake/_ping": {
+    "has_body": false,
+    "operation_id": "module_ping_api_v1_intake__ping_get",
+    "params": [
+      "header:authorization"
+    ],
+    "responses": [
+      "200",
+      "422"
+    ]
+  },
+  "GET /api/v1/intake/_status": {
+    "has_body": false,
+    "operation_id": "module_status_api_v1_intake__status_get",
+    "params": [],
+    "responses": [
+      "200"
+    ]
+  },
+  "GET /api/v1/ledger/_ping": {
+    "has_body": false,
+    "operation_id": "module_ping_api_v1_ledger__ping_get",
+    "params": [
+      "header:authorization"
+    ],
+    "responses": [
+      "200",
+      "422"
+    ]
+  },
+  "GET /api/v1/ledger/_status": {
+    "has_body": false,
+    "operation_id": "module_status_api_v1_ledger__status_get",
+    "params": [],
+    "responses": [
+      "200"
+    ]
+  },
+  "GET /api/v1/tasks/_ping": {
+    "has_body": false,
+    "operation_id": "module_ping_api_v1_tasks__ping_get",
+    "params": [
+      "header:authorization"
+    ],
+    "responses": [
+      "200",
+      "422"
+    ]
+  },
+  "GET /api/v1/tasks/_status": {
+    "has_body": false,
+    "operation_id": "module_status_api_v1_tasks__status_get",
+    "params": [],
+    "responses": [
+      "200"
+    ]
+  },
+  "GET /health": {
+    "has_body": false,
+    "operation_id": "health_health_get",
+    "params": [],
+    "responses": [
+      "200"
+    ]
+  },
+  "GET /ready": {
+    "has_body": false,
+    "operation_id": "ready_ready_get",
+    "params": [],
+    "responses": [
+      "200"
+    ]
+  },
+  "GET /version": {
+    "has_body": false,
+    "operation_id": "version_version_get",
+    "params": [],
+    "responses": [
+      "200"
+    ]
+  }
+}

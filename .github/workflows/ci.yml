@@ -1,5 +1,12 @@
 name: CI
 
+# 设计说明
+# 1) 六路 job 并行（backend / web / agent / migrations / plan / secrets），总时长目标 < 4 分钟；
+# 2) 分支保护只要求一个必过检查：`gate`。它聚合全部结果，
+#    因此新增/改名 job 不需要动仓库设置（10 个窗口并行时这点很关键）；
+# 3) 所有 job 都有 timeout，防止挂死的测试吃掉额度；
+# 4) 每个 job 都设了 `if: always()` 的兜底，任何一路失败都不会让 gate 卡在 pending。
+
 on:
   push:
     branches: [main]
@@ -8,7 +15,6 @@ on:
   workflow_dispatch:
 
 concurrency:
-  # 同一 PR 只保留最新一次运行，避免排队浪费额度
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
@@ -24,6 +30,7 @@ jobs:
   backend:
     name: backend · lint + unit
     runs-on: ubuntu-latest
+    timeout-minutes: 12
     defaults:
       run:
         working-directory: backend
@@ -35,15 +42,20 @@ jobs:
           cache: pip
           cache-dependency-path: backend/pyproject.toml
       - name: Install
-        run: pip install -e ".[dev]"
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
       - name: Ruff
         run: ruff check app tests
       - name: Pytest
+        env:
+          APP_ENV: dev
         run: pytest -q
 
   migrations:
     name: backend · migrations
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     services:
       postgres:
         image: postgres:16-alpine
@@ -60,6 +72,7 @@ jobs:
         working-directory: backend
     env:
       DATABASE_URL: postgresql+asyncpg://afc:afc@localhost:5432/afc
+      DATABASE_URL_SYNC: postgresql+psycopg://afc:afc@localhost:5432/afc
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -67,12 +80,18 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
           cache-dependency-path: backend/pyproject.toml
-      - run: pip install -e ".[dev]"
-      - name: 单一 head 检查（防止多头）
+      - run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: 单一 head 检查（防止两个窗口各建一个 head）
         run: |
-          heads=$(alembic heads | wc -l | tr -d ' ')
+          heads=$(alembic heads | grep -c "(head)" || true)
           echo "heads=$heads"
-          test "$heads" = "1"
+          alembic heads
+          if [ "$heads" != "1" ]; then
+            echo "::error::迁移出现多头，请先 alembic merge 生成合并 revision"
+            exit 1
+          fi
       - name: upgrade → downgrade → upgrade（迁移必须可回滚）
         run: |
           alembic upgrade head
@@ -80,8 +99,9 @@ jobs:
           alembic upgrade head
 
   agent:
-    name: agent · go vet + build
+    name: agent · go vet + test
     runs-on: ubuntu-latest
+    timeout-minutes: 12
     defaults:
       run:
         working-directory: agent
@@ -91,14 +111,21 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache-dependency-path: agent/go.sum
-      - run: gofmt -l . | tee /tmp/fmt.txt && test ! -s /tmp/fmt.txt
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::以下文件未格式化：$unformatted"
+            exit 1
+          fi
       - run: go vet ./...
-      - run: go test ./...
+      - run: go test ./... -race -count=1
       - run: go build ./...
 
   web:
     name: web · typecheck + build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: web
@@ -111,7 +138,7 @@ jobs:
           cache-dependency-path: web/package-lock.json
       - name: Install
         run: |
-          # 有 lockfile 必须用 ci（确定性）；骨架期尚未提交 lockfile 时退化为 install
+          # 有 lockfile 必须用 ci（确定性）；骨架期未提交 lockfile 时退化为 install
           if [ -f package-lock.json ]; then
             npm ci --no-audit --no-fund
           else
@@ -123,11 +150,44 @@ jobs:
       - name: Build
         run: npm run build
         env:
+          NEXT_TELEMETRY_DISABLED: "1"
           NEXT_PUBLIC_API_BASE_URL: http://localhost:8000/api/v1
+
+  plan:
+    name: plan · 边界与契约
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 需要 diff 才能判断越界与冻结文件改动
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - name: Install deps
+        run: pip install pyyaml
+      - name: Window boundaries
+        env:
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          base="origin/${{ github.base_ref || 'main' }}"
+          git fetch origin "${{ github.base_ref || 'main' }}" --depth=1
+          python scripts/check_boundaries.py --changed --base "$base"
+      - name: 冲突标记与本地卫生
+        run: bash scripts/pr_precheck.sh --local || [ $? -eq 2 ]
+      - name: OpenAPI 契约快照
+        run: |
+          python -m pip install --quiet --no-input -e backend 2>/dev/null || pip install -q -e backend
+          if [ -f backend/openapi.snapshot.json ]; then
+            python scripts/openapi_snapshot.py --check
+          else
+            echo "::warning::尚无 openapi.snapshot.json（W01-I05 交付后启用此检查）"
+          fi
 
   secrets:
     name: repo · secret scan
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
         with:
@@ -143,3 +203,23 @@ jobs:
           if git grep -nE '(sk-[A-Za-z0-9]{20,}|ghp_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16})' -- . ':!*.md' ':!*.lock'; then
             echo "疑似真实令牌被提交"; exit 1
           fi
+
+  gate:
+    name: gate
+    runs-on: ubuntu-latest
+    needs: [backend, migrations, agent, web, plan, secrets]
+    if: always()
+    steps:
+      - name: 聚合结果
+        run: |
+          echo "backend=${{ needs.backend.result }}"
+          echo "migrations=${{ needs.migrations.result }}"
+          echo "agent=${{ needs.agent.result }}"
+          echo "web=${{ needs.web.result }}"
+          echo "plan=${{ needs.plan.result }}"
+          echo "secrets=${{ needs.secrets.result }}"
+          if [ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" = "true" ]; then
+            echo "::error::存在未通过的检查，见上方各 job"
+            exit 1
+          fi
+          echo "全部门禁通过"

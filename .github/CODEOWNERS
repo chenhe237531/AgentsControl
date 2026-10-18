@@ -1,0 +1,36 @@
+# CODEOWNERS
+#
+# 作用：PR 自动指派审阅人。10 个窗口并行时，它的真正价值不是"找人审"，
+# 而是**让越界改动在 GitHub UI 上立刻显形**——你会看到一条意料之外的 review request。
+#
+# 单人项目里所有条目都指向同一账号；等你引入协作/机器人账号时，
+# 只需把对应行换成那个账号，规则不用重写。
+
+# 默认：所有文件归仓库主人
+*                                   @jackma3327
+
+# ── 冻结文件：改这里必须在 PR 里说明，且需 x-shared-registry 标签
+/backend/app/api/router.py          @jackma3327
+/web/src/config/nav.ts              @jackma3327
+/backend/app/core/                  @jackma3327
+/agent/internal/protocol/types.go   @jackma3327
+
+# ── 计划与边界：只能由 Merge Marshal 在波次边界改
+/plan/                              @jackma3327
+/scripts/check_boundaries.py        @jackma3327
+/.github/workflows/ci.yml           @jackma3327
+
+# ── 各窗口的独占目录（显式列出，便于代码审查时快速定位归属）
+/backend/app/modules/identity/      @jackma3327
+/backend/app/modules/intake/        @jackma3327
+/backend/app/modules/goals/         @jackma3327
+/backend/app/modules/tasks/         @jackma3327
+/backend/app/modules/devices/       @jackma3327
+/backend/app/modules/execution/     @jackma3327
+/backend/app/modules/ledger/        @jackma3327
+/backend/app/modules/approvals/     @jackma3327
+/backend/app/modules/evals/         @jackma3327
+/backend/app/modules/github_sync/   @jackma3327
+/agent/                             @jackma3327
+/web/                               @jackma3327
+/deploy/                            @jackma3327
