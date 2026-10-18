@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -181,9 +182,13 @@ def device_post(
     ts: int | None = None,
     key: str | None = None,
 ):
-    """以设备身份发 HMAC 签名请求（签名密钥 = sha256(明文 token)，与生产派生规则一致）。"""
+    """以设备身份发 HMAC 签名请求（签名密钥 = sha256(明文 token)，与生产派生规则一致）。
+
+    注意：HMAC 头的时间戳用真实当前时间（验签窗口以服务端真实时钟为准）；
+    payload 里的业务时间戳（如 ts/occurred_at）才用 FakeClock 的 TS0。
+    """
     body = json.dumps(payload).encode()
-    ts = TS0 if ts is None else ts
+    ts = int(time.time()) if ts is None else ts
     sig = sign_hmac(key or hash_device_token(token), body, ts)
     return client.post(
         path,
@@ -313,3 +318,137 @@ class TestRegister:
         assert record.status == "offline"
         assert record.token_hash == hash_device_token(body["token"])
         assert record.revoked_at is None
+
+
+# =========================================================================
+# W04-I02 · HMAC 验签中间件
+# =========================================================================
+
+
+def _starlette_request(body: bytes, headers: dict[str, str]):
+    from starlette.requests import Request
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/devices/heartbeat",
+        "headers": [(k.lower().encode(), v.encode()) for k, v in headers.items()],
+        "query_string": b"",
+    }
+
+    async def receive():  # noqa: ANN202
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    return Request(scope, receive)
+
+
+def _signed_headers(token: str, payload: dict, *, ts: int | None = None, key: str | None = None) -> dict[str, str]:
+    """构造 HMAC 头。ts 必须用真实当前时间（verify_hmac 的时间窗以服务端真实时钟为准）。"""
+    body = json.dumps(payload).encode()
+    ts = int(time.time()) if ts is None else ts
+    return {
+        "X-Afc-Node": payload["node"],
+        "X-Afc-Timestamp": str(ts),
+        "X-Afc-Signature": sign_hmac(key or hash_device_token(token), body, ts),
+    }
+
+
+class TestHmac:
+    async def _verify(self, fake: FakeState, payload: dict, headers: dict[str, str], body: bytes | None = None):
+        from app.modules.devices.hmac import verify_device_signature
+
+        request = _starlette_request(body if body is not None else json.dumps(payload).encode(), headers)
+        return await verify_device_signature(
+            request,
+            fake.service,
+            x_afc_node=headers["X-Afc-Node"],
+            x_afc_timestamp=int(headers["X-Afc-Timestamp"]),
+            x_afc_signature=headers["X-Afc-Signature"],
+        )
+
+    async def test_valid_signature_passes(self, fake: FakeState, client: TestClient, owner_headers) -> None:
+        body = register_device(client, fake, owner_headers, "mac-1")
+        payload = {"node": "mac-1", "ts": TS0, "seq": 1}
+        # 密钥 = sha256(注册响应里的明文 token) —— 与设备端派生规则一致
+        principal = await self._verify(fake, payload, _signed_headers(body["token"], payload))
+        assert principal.node_id == "mac-1"
+        assert principal.trust == "managed"
+
+    async def test_tampered_body_rejected(self, fake: FakeState, client: TestClient, owner_headers) -> None:
+        body = register_device(client, fake, owner_headers, "mac-1")
+        payload = {"node": "mac-1", "ts": TS0, "seq": 1}
+        headers = _signed_headers(body["token"], payload)
+        # 签名对 payload，实际发送被篡改的 body —— 必须拒绝
+        from app.core.errors import UnauthorizedError
+
+        with pytest.raises(UnauthorizedError):
+            await self._verify(fake, payload, headers, body=json.dumps({**payload, "seq": 2}).encode())
+
+    async def test_stale_timestamp_rejected(self, fake: FakeState, client: TestClient, owner_headers) -> None:
+        body = register_device(client, fake, owner_headers, "mac-1")
+        payload = {"node": "mac-1", "ts": TS0, "seq": 1}
+        # 用正确密钥签，但时间戳超出 300s 窗口（相对服务端真实时钟）
+        from app.core.errors import UnauthorizedError
+
+        headers = _signed_headers(body["token"], payload, ts=int(time.time()) - 400)
+        with pytest.raises(UnauthorizedError):
+            await self._verify(fake, payload, headers, body=json.dumps(payload).encode())
+
+    async def test_wrong_key_rejected(self, fake: FakeState, client: TestClient, owner_headers) -> None:
+        register_device(client, fake, owner_headers, "mac-1")
+        payload = {"node": "mac-1", "ts": TS0, "seq": 1}
+        from app.core.errors import UnauthorizedError
+
+        with pytest.raises(UnauthorizedError):
+            await self._verify(fake, payload, _signed_headers("wrong-key-not-the-token", payload))
+
+    async def test_unknown_node_same_error_as_bad_signature(self, fake: FakeState, client: TestClient, owner_headers) -> None:
+        """防枚举：未知节点与签名错误必须是同一个错误、同一文案。"""
+        from app.core.errors import UnauthorizedError
+
+        payload = {"node": "ghost", "ts": TS0, "seq": 1}
+        with pytest.raises(UnauthorizedError) as e_unknown:
+            await self._verify(fake, payload, _signed_headers("whatever-key", payload))
+        register_device(client, fake, owner_headers, "mac-1")
+        payload2 = {"node": "mac-1", "ts": TS0, "seq": 1}
+        with pytest.raises(UnauthorizedError) as e_badsig:
+            await self._verify(fake, payload2, _signed_headers("whatever-key", payload2))
+        assert str(e_unknown.value) == str(e_badsig.value)
+
+    async def test_revoked_device_rejected(self, fake: FakeState, client: TestClient, owner_headers) -> None:
+        body = register_device(client, fake, owner_headers, "mac-1")
+        client.post(f"{API}/mac-1/revoke", headers=owner_headers)
+        payload = {"node": "mac-1", "ts": TS0, "seq": 1}
+        from app.core.errors import UnauthorizedError
+
+        with pytest.raises(UnauthorizedError):
+            await self._verify(fake, payload, _signed_headers(body["token"], payload))
+
+    async def test_rate_limit_after_10_failures(self, fake: FakeState, client: TestClient, owner_headers, monkeypatch) -> None:
+        register_device(client, fake, owner_headers, "mac-1")
+
+        calls = {"n": 0}
+
+        async def fake_incr(key: str, ttl: int) -> int:
+            calls["n"] += 1
+            return calls["n"]
+
+        monkeypatch.setattr("app.modules.devices.hmac.incr_with_ttl", fake_incr)
+
+        from app.core.errors import RateLimitedError, UnauthorizedError
+        from app.modules.devices.hmac import HMAC_FAIL_LIMIT_PER_MINUTE
+
+        payload = {"node": "mac-1", "ts": TS0, "seq": 1}
+        headers = _signed_headers("bad-key", payload)
+        for _ in range(HMAC_FAIL_LIMIT_PER_MINUTE - 1):
+            with pytest.raises(UnauthorizedError):
+                await self._verify(fake, payload, headers)
+        with pytest.raises(RateLimitedError):  # 第 10 次失败 → 429
+            await self._verify(fake, payload, headers)
+
+    async def test_third_party_can_report(self, fake: FakeState, client: TestClient, owner_headers) -> None:
+        """第三方设备能正常验签上报（它只是不接收指令，I06 验证）。"""
+        body = register_device(client, fake, owner_headers, "api-ext", trust="third_party")
+        payload = {"node": "api-ext", "ts": TS0, "seq": 1}
+        principal = await self._verify(fake, payload, _signed_headers(body["token"], payload))
+        assert principal.trust == "third_party"
