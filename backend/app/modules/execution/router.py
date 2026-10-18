@@ -19,6 +19,7 @@ HTTP 端点分四组（按 issue 顺序落地）：
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Response
@@ -30,13 +31,17 @@ from app.core.errors import NotImplementedYetError
 from app.modules.execution import orca as exec_orca
 from app.modules.execution import protocol as proto
 from app.modules.execution import service as svc
+from app.modules.execution import worktree as exec_worktree
 from app.modules.execution.repository import (
     EventStore,
+    SessionRow,
+    SessionStore,
     SqlEventStore,
+    SqlSessionStore,
     SqlWorkerStore,
     WorkerStore,
 )
-from app.modules.execution.schemas import OrcaHealthView
+from app.modules.execution.schemas import OrcaHealthView, SessionCreateRequest, SessionView
 
 MODULE = "execution"
 OWNER_WINDOW = "W06"
@@ -69,6 +74,29 @@ def get_worker_service(
 
 
 WorkerServiceDep = Annotated[svc.WorkerService, Depends(get_worker_service)]
+
+
+def get_session_store(db: DbDep) -> SessionStore:
+    return SqlSessionStore(db)
+
+
+def get_worktree_manager() -> exec_worktree.WorktreeManager:
+    return exec_worktree.default_manager()
+
+
+def get_session_service(
+    sessions: Annotated[SessionStore, Depends(get_session_store)],
+    events: Annotated[EventStore, Depends(get_event_store)],
+    worktrees: Annotated[exec_worktree.WorktreeManager, Depends(get_worktree_manager)],
+) -> svc.SessionService:
+    return svc.SessionService(sessions=sessions, events=events, worktrees=worktrees)
+
+
+SessionServiceDep = Annotated[svc.SessionService, Depends(get_session_service)]
+
+
+def _session_view(row: SessionRow) -> SessionView:
+    return SessionView(**asdict(row))
 
 
 # ---------------------------------------------------------------- 骨架自检
@@ -110,6 +138,38 @@ async def orca_health(_: OwnerDep, force: bool = False) -> OrcaHealthView:
         error=result.error,
         details=result.details,
     )
+
+
+# ---------------------------------------------------------------- 会话生命周期（W06-I03）
+
+@router.post(
+    "/sessions",
+    status_code=201,
+    summary="创建会话：建 worktree（.worktrees/<issue>-<slug>）并写 .fleet-task.json",
+    response_model=SessionView,
+)
+async def create_session(
+    body: SessionCreateRequest,
+    _: OwnerDep,
+    service: SessionServiceDep,
+) -> SessionView:
+    row = await service.create_session(body)
+    return _session_view(row)
+
+
+@router.delete(
+    "/sessions/{session_id}",
+    summary="回收会话：未提交改动会拒绝并返回文件清单（?force=1 强制丢弃）",
+    response_model=SessionView,
+)
+async def recycle_session(
+    session_id: str,
+    _: OwnerDep,
+    service: SessionServiceDep,
+    force: bool = False,
+) -> SessionView:
+    row = await service.recycle_session(session_id, force=force)
+    return _session_view(row)
 
 
 # ---------------------------------------------------------------- Worker 协议（W06-I01）

@@ -9,8 +9,11 @@
 from __future__ import annotations
 
 import importlib
+import json
+import subprocess
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -21,7 +24,14 @@ from app.main import create_app
 from app.modules.execution import orca as exec_orca
 from app.modules.execution import protocol as proto
 from app.modules.execution.protocol import LeasedTask
-from app.modules.execution.repository import EventRecord, WorkerInfo
+from app.modules.execution.repository import EventRecord, SessionRow, WorkerInfo
+from app.modules.execution.worktree import (
+    FLEET_TASK_FILENAME,
+    GitCommandError,
+    WorktreeExistsError,
+    WorktreeManager,
+    fleet_task_idem_key,
+)
 
 # 包 __init__ 把 `router` 导出为 APIRouter 实例（路由注册点约定），
 # 测试要拿的是 router *模块*（依赖装配函数挂在那上面）。
@@ -149,6 +159,36 @@ class FakeEventStore:
         return [r.kind for r in self.rows if r.task_id == task_id]
 
 
+class FakeSessionStore:
+    def __init__(self) -> None:
+        self.rows: dict[str, SessionRow] = {}
+        self.commits = 0
+
+    async def create(self, row: SessionRow) -> SessionRow:
+        self.rows[row.id] = row
+        return row
+
+    async def get(self, session_id: str) -> SessionRow | None:
+        return self.rows.get(session_id)
+
+    async def find_active_by_name(self, issue: str, slug: str) -> SessionRow | None:
+        for row in self.rows.values():
+            if row.issue == issue and row.slug == slug and row.state != "recycled":
+                return row
+        return None
+
+    async def update(self, session_id: str, **fields: Any) -> SessionRow | None:
+        row = self.rows.get(session_id)
+        if row is None:
+            return None
+        updated = replace(row, **fields, updated_at=utcnow())
+        self.rows[session_id] = updated
+        return updated
+
+    async def commit(self) -> None:
+        self.commits += 1
+
+
 @pytest.fixture()
 def workers_store() -> FakeWorkerStore:
     return FakeWorkerStore()
@@ -162,6 +202,54 @@ def events_store() -> FakeEventStore:
 @pytest.fixture()
 def gateway() -> FakeTasksGateway:
     return FakeTasksGateway()
+
+
+@pytest.fixture()
+def sessions_store() -> FakeSessionStore:
+    return FakeSessionStore()
+
+
+@pytest.fixture()
+def tmp_repo(tmp_path: Path) -> Path:
+    """最小可用的真实 git 仓库（git init + 初始提交），绝不碰主仓。"""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for args in (
+        ["git", "init", "-b", "main"],
+        ["git", "config", "user.email", "test@example.com"],
+        ["git", "config", "user.name", "test"],
+    ):
+        subprocess.run(args, cwd=repo, check=True, capture_output=True)
+    (repo / "README.md").write_text("# tmp\n", encoding="utf-8")
+    git_commit(repo, "init")
+    return repo
+
+
+def git_commit(cwd: Path, message: str) -> None:
+    subprocess.run(["git", "add", "-A"], cwd=cwd, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", message], cwd=cwd, check=True, capture_output=True
+    )
+
+
+@pytest.fixture()
+def sessions_client(
+    tmp_repo: Path,
+    workers_store: FakeWorkerStore,
+    events_store: FakeEventStore,
+    gateway: FakeTasksGateway,
+    sessions_store: FakeSessionStore,
+) -> TestClient:
+    """带会话 fake 与真实临时 git 仓库的 App（worktree 操作走真 git 子进程）。"""
+    app = create_app()
+    app.dependency_overrides[exec_router.get_worker_store] = lambda: workers_store
+    app.dependency_overrides[exec_router.get_event_store] = lambda: events_store
+    app.dependency_overrides[exec_router.get_tasks_gateway] = lambda: gateway
+    app.dependency_overrides[exec_router.get_session_store] = lambda: sessions_store
+    app.dependency_overrides[exec_router.get_worktree_manager] = lambda: WorktreeManager(
+        tmp_repo
+    )
+    return TestClient(app)
 
 
 @pytest.fixture()
@@ -590,4 +678,262 @@ class TestOrcaHealthEndpoint:
         app = create_app()
         with TestClient(app) as c:
             r = c.get("/api/v1/execution/orca/health")
+        assert r.status_code == 401
+
+
+# ================================================================ W06-I03 · worktree 生命周期
+
+class TestWorktreeManager:
+    """真 git 子进程 + 临时仓库（I03 验收 ④：不碰真实仓库）。"""
+
+    async def test_create_writes_fleet_task_and_branch(self, tmp_repo):
+        mgr = WorktreeManager(tmp_repo)
+        info = await mgr.create(
+            issue="W06I03",
+            slug="fix-login",
+            fleet_task={"task_id": "T-0412", "idem_key": "abc123"},
+        )
+        assert info.branch == "issue/W06I03-fix-login"
+        path = Path(info.path)
+        assert path == tmp_repo / ".worktrees" / "W06I03-fix-login"
+        assert path.is_dir()
+        on_disk = mgr.read_fleet_task(info.path)
+        assert on_disk["task_id"] == "T-0412"
+        assert on_disk["idem_key"] == "abc123"
+
+    async def test_create_with_base_ref(self, tmp_repo):
+        mgr = WorktreeManager(tmp_repo)
+        info = await mgr.create(issue="W06I03", slug="on-main", base_ref="main")
+        assert info.base_ref == "main"
+        assert (Path(info.path) / "README.md").is_file()  # base_ref 的内容被检出
+
+    async def test_duplicate_create_raises(self, tmp_repo):
+        mgr = WorktreeManager(tmp_repo)
+        await mgr.create(issue="W06I03", slug="dup")
+        with pytest.raises(WorktreeExistsError):
+            await mgr.create(issue="W06I03", slug="dup")
+
+    async def test_fleet_task_file_is_not_agent_work(self, tmp_repo):
+        """.fleet-task.json 是控制面元数据：不算未提交改动，干净回收不被拒。"""
+        mgr = WorktreeManager(tmp_repo)
+        info = await mgr.create(
+            issue="W06I03", slug="clean", fleet_task={"task_id": "T-0412"}
+        )
+        assert (Path(info.path) / FLEET_TASK_FILENAME).is_file()
+        assert await mgr.uncommitted_files(info.path) == []
+        await mgr.remove(info.path)  # 无需 force
+        assert not Path(info.path).exists()
+
+    async def test_uncommitted_files_detects_agent_changes(self, tmp_repo):
+        mgr = WorktreeManager(tmp_repo)
+        info = await mgr.create(issue="W06I03", slug="dirty")
+        assert await mgr.uncommitted_files(info.path) == []
+        (Path(info.path) / "WIP.patch").write_text("x", encoding="utf-8")
+        assert await mgr.uncommitted_files(info.path) == ["WIP.patch"]
+
+    async def test_remove_refuses_dirty_worktree_until_forced(self, tmp_repo):
+        mgr = WorktreeManager(tmp_repo)
+        info = await mgr.create(issue="W06I03", slug="guard")
+        (Path(info.path) / "WIP.patch").write_text("x", encoding="utf-8")
+        with pytest.raises(GitCommandError):
+            await mgr.remove(info.path)
+        assert Path(info.path).exists()  # 拒绝时磁盘事实不动
+        await mgr.remove(info.path, force=True)
+        assert not Path(info.path).exists()
+
+    async def test_recreate_after_remove_reuses_branch(self, tmp_repo):
+        """回收后重派同名会话：分支被复用，其上的提交不丢。"""
+        mgr = WorktreeManager(tmp_repo)
+        first = await mgr.create(issue="W06I03", slug="again")
+        (Path(first.path) / "feature.py").write_text("print('v1')\n", encoding="utf-8")
+        git_commit(Path(first.path), "feat")
+        await mgr.remove(first.path)
+
+        second = await mgr.create(issue="W06I03", slug="again")
+        assert second.branch == first.branch
+        assert (Path(second.path) / "feature.py").read_text(encoding="utf-8") == "print('v1')\n"
+
+    def test_fleet_task_idem_key_is_deterministic(self):
+        assert fleet_task_idem_key("T-1", "/a") == fleet_task_idem_key("T-1", "/a")
+        assert fleet_task_idem_key("T-1", "/a") != fleet_task_idem_key("T-2", "/a")
+        assert fleet_task_idem_key("T-1", "/a") != fleet_task_idem_key("T-1", "/b")
+        assert len(fleet_task_idem_key("T-1", "/a")) == 16
+
+
+def create_session_body(**overrides) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "task_id": "T-0412",
+        "issue": "W06I03",
+        "slug": "fix-login",
+        "capability": "code.build.feature",
+        "device_id": "mac-mini-m4",
+        "objective_id": "O-001",
+        "prompt_ver": "v3",
+        "skill_versions": {"repo": "a1b2c3"},
+        "budget_remaining": {"usd": 5.0},
+        "acceptance": {"cmd": "pytest -q", "must_pass": ["backend/tests/"]},
+    }
+    body.update(overrides)
+    return body
+
+
+class TestSessionLifecycle:
+    def test_create_session_creates_worktree_and_fleet_task(
+        self, sessions_client, events_store
+    ):
+        r = sessions_client.post(
+            "/api/v1/execution/sessions", headers=AUTH, json=create_session_body()
+        )
+        assert r.status_code == 201
+        body = r.json()
+        assert body["state"] == "created"
+        assert body["branch"] == "issue/W06I03-fix-login"
+        assert body["runtime"] == "generic"
+
+        wt = Path(body["worktree_path"])
+        assert wt.is_dir()
+        fleet = json.loads((wt / FLEET_TASK_FILENAME).read_text(encoding="utf-8"))
+        assert fleet["task_id"] == "T-0412"
+        assert fleet["session_id"] == body["id"]
+        assert fleet["capability"] == "code.build.feature"
+        assert fleet["acceptance"]["cmd"] == "pytest -q"
+        assert fleet["idem_key"] == body["fleet_task"]["idem_key"]
+        assert len(fleet["idem_key"]) == 16
+        # 落事件供会话视图（I06）展示
+        assert events_store.kinds("T-0412") == ["session.created"]
+
+    def test_create_session_rejects_duplicate_active_session(self, sessions_client):
+        first = sessions_client.post(
+            "/api/v1/execution/sessions", headers=AUTH, json=create_session_body()
+        )
+        assert first.status_code == 201
+        second = sessions_client.post(
+            "/api/v1/execution/sessions",
+            headers=AUTH,
+            json=create_session_body(task_id="T-9999"),  # 同 issue+slug，不同 task
+        )
+        assert second.status_code == 409
+        assert second.json()["error"]["code"] == "session_exists"
+
+    def test_create_session_refuses_preexisting_worktree_dir(self, sessions_client, tmp_repo):
+        """库里有会话但目录被外部占用（或反之）：绝不产生第二个 worktree。"""
+        (tmp_repo / ".worktrees" / "W06I03-ghost").mkdir(parents=True)
+        r = sessions_client.post(
+            "/api/v1/execution/sessions",
+            headers=AUTH,
+            json=create_session_body(slug="ghost"),
+        )
+        assert r.status_code == 409
+        assert r.json()["error"]["code"] == "session_exists"
+
+    def test_create_session_validates_slug_charset(self, sessions_client):
+        r = sessions_client.post(
+            "/api/v1/execution/sessions",
+            headers=AUTH,
+            json=create_session_body(slug="Bad_Slug"),
+        )
+        assert r.status_code == 422
+
+    def test_create_session_requires_explicit_slug_when_task_id_not_slug_safe(
+        self, sessions_client
+    ):
+        r = sessions_client.post(
+            "/api/v1/execution/sessions",
+            headers=AUTH,
+            json=create_session_body(slug=None),  # task_id=T-0412 含大写
+        )
+        assert r.status_code == 422
+
+    def test_create_session_defaults_slug_from_slug_safe_task_id(self, sessions_client):
+        r = sessions_client.post(
+            "/api/v1/execution/sessions",
+            headers=AUTH,
+            json=create_session_body(task_id="t0412", slug=None),
+        )
+        assert r.status_code == 201
+        assert r.json()["slug"] == "t0412"
+        assert r.json()["branch"] == "issue/W06I03-t0412"
+
+    def test_recycle_clean_session(self, sessions_client, events_store):
+        created = sessions_client.post(
+            "/api/v1/execution/sessions", headers=AUTH, json=create_session_body()
+        ).json()
+        r = sessions_client.delete(
+            f"/api/v1/execution/sessions/{created['id']}", headers=AUTH
+        )
+        assert r.status_code == 200
+        assert r.json()["state"] == "recycled"
+        assert not Path(created["worktree_path"]).exists()
+        assert events_store.kinds("T-0412") == ["session.created", "session.recycled"]
+
+    def test_recycle_dirty_session_returns_file_list(self, sessions_client):
+        created = sessions_client.post(
+            "/api/v1/execution/sessions", headers=AUTH, json=create_session_body()
+        ).json()
+        (Path(created["worktree_path"]) / "WIP.patch").write_text("wip\n", encoding="utf-8")
+        r = sessions_client.delete(
+            f"/api/v1/execution/sessions/{created['id']}", headers=AUTH
+        )
+        assert r.status_code == 409
+        err = r.json()["error"]
+        assert err["code"] == "worktree_dirty"
+        assert "WIP.patch" in err["details"]["files"]
+        # 拒绝时 Agent 的工作原样保留
+        assert Path(created["worktree_path"], "WIP.patch").is_file()
+
+    def test_recycle_force_discards_dirty_worktree(self, sessions_client):
+        created = sessions_client.post(
+            "/api/v1/execution/sessions", headers=AUTH, json=create_session_body()
+        ).json()
+        (Path(created["worktree_path"]) / "WIP.patch").write_text("wip\n", encoding="utf-8")
+        r = sessions_client.delete(
+            f"/api/v1/execution/sessions/{created['id']}?force=true", headers=AUTH
+        )
+        assert r.status_code == 200
+        assert r.json()["state"] == "recycled"
+        assert not Path(created["worktree_path"]).exists()
+
+    def test_recycle_is_idempotent(self, sessions_client, events_store):
+        created = sessions_client.post(
+            "/api/v1/execution/sessions", headers=AUTH, json=create_session_body()
+        ).json()
+        first = sessions_client.delete(
+            f"/api/v1/execution/sessions/{created['id']}", headers=AUTH
+        )
+        second = sessions_client.delete(
+            f"/api/v1/execution/sessions/{created['id']}", headers=AUTH
+        )
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert second.json()["state"] == "recycled"
+        # 幂等回收不重复落事件
+        assert events_store.kinds("T-0412") == ["session.created", "session.recycled"]
+
+    def test_recycle_unknown_session_404(self, sessions_client):
+        r = sessions_client.delete(
+            "/api/v1/execution/sessions/s-nope", headers=AUTH
+        )
+        assert r.status_code == 404
+        assert r.json()["error"]["code"] == "session_not_found"
+
+    def test_redispatch_after_recycle_reuses_branch(self, sessions_client):
+        """一任务一分支：回收后重派，新会话复用同名分支。"""
+        first = sessions_client.post(
+            "/api/v1/execution/sessions", headers=AUTH, json=create_session_body()
+        ).json()
+        sessions_client.delete(
+            f"/api/v1/execution/sessions/{first['id']}", headers=AUTH
+        )
+        second = sessions_client.post(
+            "/api/v1/execution/sessions", headers=AUTH, json=create_session_body()
+        ).json()
+        assert second["id"] != first["id"]
+        assert second["branch"] == first["branch"]
+
+    def test_session_endpoints_require_auth(self, sessions_client):
+        r = sessions_client.post(
+            "/api/v1/execution/sessions", json=create_session_body()
+        )
+        assert r.status_code == 401
+        r = sessions_client.delete("/api/v1/execution/sessions/s-1")
         assert r.status_code == 401

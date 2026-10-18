@@ -4,7 +4,7 @@
 执行面只维护三样自己的东西：
 - `execution_workers`   Worker 注册表（谁在领活、能力标签、最后在线）
 - `task_events`         任务事件流（claimed/completed/failed/cost/…，供 W07 归集、W10 展示）
-- `execution_sessions`  会话与 worktree（W06-I03 起交付，追加在同文件）
+- `execution_sessions`  会话 = 租约 + worktree（一任务一分支一 worktree）
 """
 
 from __future__ import annotations
@@ -50,5 +50,42 @@ class TaskEvent(Base):
     source: Mapped[str] = mapped_column(sa.Text, nullable=False, server_default="service")
     payload: Mapped[dict] = mapped_column(sa.JSON, nullable=False, server_default=sa.text("'{}'"))
     created_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()
+    )
+
+
+class ExecutionSession(Base):
+    """会话 = 租约 + worktree。状态机：
+
+    created → running（spawn）→ harvesting → harvested
+              └→ killed / failed（kill 或会话崩溃）→ harvesting → harvested
+    任意状态 → recycled（worktree 已删；创建/回收幂等防重派）
+    """
+
+    __tablename__ = "execution_sessions"
+    __table_args__ = (sa.Index("ix_execution_sessions_issue_slug", "issue", "slug"),)
+
+    id: Mapped[str] = mapped_column(sa.Text, primary_key=True)
+    task_id: Mapped[str] = mapped_column(sa.Text, nullable=False, index=True)
+    issue: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    slug: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    runtime: Mapped[str] = mapped_column(sa.Text, nullable=False, server_default="generic")
+    state: Mapped[str] = mapped_column(sa.Text, nullable=False, server_default="created")
+    branch: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    worktree_path: Mapped[str] = mapped_column(sa.Text, nullable=False)
+    base_ref: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+    orca_session: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+    device_id: Mapped[str | None] = mapped_column(sa.Text, nullable=True, index=True)
+    objective_id: Mapped[str | None] = mapped_column(sa.Text, nullable=True, index=True)
+    transcript_url: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+    diff_summary: Mapped[dict | None] = mapped_column(sa.JSON, nullable=True)
+    error: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+    fleet_task: Mapped[dict] = mapped_column(sa.JSON, nullable=False, server_default=sa.text("'{}'"))
+    spawned_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
+    ended_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
         sa.DateTime(timezone=True), nullable=False, server_default=sa.func.now()
     )

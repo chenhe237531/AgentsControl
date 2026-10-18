@@ -45,6 +45,32 @@ class EventRecord:
     created_at: datetime | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class SessionRow:
+    """会话领域对象。字段与 execution_sessions 表一一对应。"""
+
+    id: str
+    task_id: str
+    issue: str
+    slug: str
+    branch: str
+    worktree_path: str
+    fleet_task: dict[str, Any] = field(default_factory=dict)
+    runtime: str = "generic"
+    state: str = "created"
+    base_ref: str | None = None
+    orca_session: str | None = None
+    device_id: str | None = None
+    objective_id: str | None = None
+    transcript_url: str | None = None
+    diff_summary: dict[str, Any] | None = None
+    error: str | None = None
+    spawned_at: datetime | None = None
+    ended_at: datetime | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
 # ---------------------------------------------------------------- 存储协议
 
 @runtime_checkable
@@ -69,6 +95,15 @@ class EventStore(Protocol):
     ) -> EventRecord: ...
     async def list_for_task(self, task_id: str, *, limit: int = 20) -> list[EventRecord]: ...
     async def list_for_session(self, session_id: str, *, limit: int = 20) -> list[EventRecord]: ...
+    async def commit(self) -> None: ...
+
+
+@runtime_checkable
+class SessionStore(Protocol):
+    async def create(self, row: SessionRow) -> SessionRow: ...
+    async def get(self, session_id: str) -> SessionRow | None: ...
+    async def find_active_by_name(self, issue: str, slug: str) -> SessionRow | None: ...
+    async def update(self, session_id: str, **fields: Any) -> SessionRow | None: ...
     async def commit(self) -> None: ...
 
 
@@ -183,6 +218,82 @@ class SqlEventStore:
         )
         rows = (await self._session.execute(stmt)).scalars().all()
         return [_event_record(r) for r in rows]
+
+    async def commit(self) -> None:
+        await self._session.commit()
+
+# ---------------------------------------------------------------- 会话存储（SQL 实现）
+
+_SESSION_COLUMNS = (
+    "id", "task_id", "issue", "slug", "runtime", "state", "branch", "worktree_path",
+    "base_ref", "orca_session", "device_id", "objective_id", "transcript_url",
+    "diff_summary", "error", "fleet_task", "spawned_at", "ended_at",
+    "created_at", "updated_at",
+)
+
+
+def _session_row(row: models.ExecutionSession) -> SessionRow:
+    return SessionRow(
+        id=row.id,
+        task_id=row.task_id,
+        issue=row.issue,
+        slug=row.slug,
+        runtime=row.runtime,
+        state=row.state,
+        branch=row.branch,
+        worktree_path=row.worktree_path,
+        base_ref=row.base_ref,
+        orca_session=row.orca_session,
+        device_id=row.device_id,
+        objective_id=row.objective_id,
+        transcript_url=row.transcript_url,
+        diff_summary=row.diff_summary,
+        error=row.error,
+        fleet_task=dict(row.fleet_task or {}),
+        spawned_at=row.spawned_at,
+        ended_at=row.ended_at,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+class SqlSessionStore:
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def create(self, row: SessionRow) -> SessionRow:
+        self._session.add(models.ExecutionSession(**{c: getattr(row, c) for c in _SESSION_COLUMNS}))
+        await self._session.flush()
+        return row
+
+    async def get(self, session_id: str) -> SessionRow | None:
+        row = await self._session.get(models.ExecutionSession, session_id)
+        return None if row is None else _session_row(row)
+
+    async def find_active_by_name(self, issue: str, slug: str) -> SessionRow | None:
+        stmt = (
+            sa.select(models.ExecutionSession)
+            .where(
+                models.ExecutionSession.issue == issue,
+                models.ExecutionSession.slug == slug,
+                models.ExecutionSession.state != "recycled",
+            )
+            .limit(1)
+        )
+        row = (await self._session.execute(stmt)).scalars().first()
+        return None if row is None else _session_row(row)
+
+    async def update(self, session_id: str, **fields: Any) -> SessionRow | None:
+        row = await self._session.get(models.ExecutionSession, session_id)
+        if row is None:
+            return None
+        for key, value in fields.items():
+            if key == "updated_at":
+                continue  # 交给下面的统一刷新
+            setattr(row, key, value)
+        row.updated_at = datetime.now(UTC)
+        await self._session.flush()
+        return _session_row(row)
 
     async def commit(self) -> None:
         await self._session.commit()

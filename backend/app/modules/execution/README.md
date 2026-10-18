@@ -23,6 +23,8 @@
 | POST | `/api/v1/execution/workers/{id}/complete` | 交货（result 必带产物引用+成本） | W06-I01 |
 | POST | `/api/v1/execution/workers/{id}/fail` | 报错（retryable 语义） | W06-I01 |
 | GET | `/api/v1/execution/orca/health` | Orca 能力自检（缓存 10 分钟，`?force=1` 强制重探） | W06-I02 |
+| POST | `/api/v1/execution/sessions` | 创建会话：建 worktree + `.fleet-task.json`（幂等防重派） | W06-I03 |
+| DELETE | `/api/v1/execution/sessions/{id}` | 回收会话：脏 worktree 拒绝并返回文件清单（`?force=1` 强制丢弃） | W06-I03 |
 
 ## 认证
 

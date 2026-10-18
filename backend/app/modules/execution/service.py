@@ -1,16 +1,21 @@
-"""业务编排：Worker 协议的四步生命周期（claim → heartbeat → complete/fail）。
+"""业务编排：Worker 协议生命周期 + 会话（= 租约 + worktree）生命周期。
 
 分层纪律：
 - 不感知 Request/Response；
 - 任务状态只通过 TasksGateway（tasks.service 公开函数）流转，本模块不写 tasks 表；
-- 每次「对外可见的语义变化」都落一条 task_events（claimed/completed/failed），
-  heartbeat 仅在携带 progress/step 时落事件（避免事件表被纯续约灌爆）。
+- 每次「对外可见的语义变化」都落一条 task_events（claimed/completed/failed/session.*），
+  heartbeat 仅在携带 progress/step 时落事件（避免事件表被纯续约灌爆）；
+- 会话红线：一任务一分支一 worktree；回收前查未提交改动，拒绝即给文件清单，
+  Agent 的工作不允许被静默丢弃。
 """
 
 from __future__ import annotations
 
 import secrets
 from datetime import UTC, datetime
+from pathlib import Path
+
+from app.core.errors import ConflictError, NotFoundError
 
 from .protocol import (
     CostBreakdown,
@@ -24,11 +29,28 @@ from .protocol import (
     WorkerHeartbeatRequest,
     WorkerHeartbeatResponse,
 )
-from .repository import EventStore, WorkerInfo, WorkerStore
+from .repository import EventStore, SessionRow, SessionStore, WorkerInfo, WorkerStore
+from .schemas import SessionCreateRequest
+from .worktree import WorktreeExistsError, WorktreeManager, fleet_task_idem_key
 
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+class SessionExistsError(ConflictError):
+    code = "session_exists"
+    message = "会话已存在：一任务一分支一 worktree，重派请复用或先回收"
+
+
+class SessionNotFoundError(NotFoundError):
+    code = "session_not_found"
+    message = "会话不存在"
+
+
+class WorktreeDirtyError(ConflictError):
+    code = "worktree_dirty"
+    message = "worktree 有未提交改动，拒绝回收"
 
 
 class WorkerService:
@@ -158,3 +180,113 @@ class WorkerService:
                 payload={"model": model, "amount": amount},
             )
         return len(cost.by_model)
+
+
+class SessionService:
+    """会话 = 租约 + worktree（W06-I03 起交付；spawn/kill/harvest 见后续 issue）。"""
+
+    def __init__(
+        self,
+        *,
+        sessions: SessionStore,
+        events: EventStore,
+        worktrees: WorktreeManager,
+    ) -> None:
+        self._sessions = sessions
+        self._events = events
+        self._worktrees = worktrees
+
+    # ------------------------------------------------------------ 创建（I03）
+
+    async def create_session(self, req: SessionCreateRequest) -> SessionRow:
+        """创建会话：查重 → 建 worktree → 写 .fleet-task.json → 落库 + 事件。
+
+        幂等防重派：同 issue+slug 存在未回收会话，或同名 worktree 目录已存在，
+        都拒绝（409），绝不产生第二个 worktree。
+        """
+        slug = req.slug or req.task_id
+        existing = await self._sessions.find_active_by_name(req.issue, slug)
+        if existing is not None:
+            raise SessionExistsError(
+                f"会话 {existing.id} 已占用 issue/{req.issue}-{slug}（state={existing.state}）"
+            )
+        session_id = f"s-{secrets.token_hex(6)}"
+        wt_path = str(self._worktrees.worktrees_dir / f"{req.issue}-{slug}")
+        fleet_task: dict = {
+            "task_id": req.task_id,
+            "session_id": session_id,
+            "objective_id": req.objective_id,
+            "capability": req.capability,
+            "budget_remaining": req.budget_remaining or {},
+            "acceptance": req.acceptance.model_dump() if req.acceptance else None,
+            "prompt_ver": req.prompt_ver,
+            "skill_versions": req.skill_versions or {},
+            "idem_key": fleet_task_idem_key(req.task_id, wt_path),
+            "created_at": _now().isoformat(),
+        }
+        try:
+            info = await self._worktrees.create(
+                issue=req.issue, slug=slug, base_ref=req.base_ref, fleet_task=fleet_task
+            )
+        except WorktreeExistsError as exc:
+            raise SessionExistsError(str(exc)) from exc
+        row = SessionRow(
+            id=session_id,
+            task_id=req.task_id,
+            issue=req.issue,
+            slug=slug,
+            runtime=req.runtime,
+            state="created",
+            branch=info.branch,
+            worktree_path=info.path,
+            base_ref=info.base_ref,
+            device_id=req.device_id,
+            objective_id=req.objective_id,
+            fleet_task=fleet_task,
+            created_at=_now(),
+            updated_at=_now(),
+        )
+        created = await self._sessions.create(row)
+        await self._events.append(
+            task_id=req.task_id,
+            kind="session.created",
+            session_id=session_id,
+            payload={
+                "branch": info.branch,
+                "worktree_path": info.path,
+                "runtime": req.runtime,
+                "idem_key": fleet_task["idem_key"],
+            },
+        )
+        await self._sessions.commit()
+        return created
+
+    # ------------------------------------------------------------ 回收（I03）
+
+    async def recycle_session(self, session_id: str, *, force: bool = False) -> SessionRow:
+        """回收 worktree。未提交改动 → 409 + 文件清单；force=1 才允许丢弃。
+
+        幂等：已回收的会话直接返回；磁盘上 worktree 目录已消失也照常标记回收。
+        """
+        row = await self._sessions.get(session_id)
+        if row is None:
+            raise SessionNotFoundError(f"会话不存在：{session_id}")
+        if row.state == "recycled":
+            return row
+        if Path(row.worktree_path).exists():
+            files = await self._worktrees.uncommitted_files(row.worktree_path)
+            if files and not force:
+                raise WorktreeDirtyError(
+                    "worktree 有未提交改动，拒绝回收（?force=1 可强制丢弃）",
+                    details={"files": files[:50]},
+                )
+            await self._worktrees.remove(row.worktree_path, force=force)
+        updated = await self._sessions.update(session_id, state="recycled", ended_at=_now())
+        await self._events.append(
+            task_id=row.task_id,
+            kind="session.recycled",
+            session_id=session_id,
+            payload={"force": force},
+        )
+        await self._sessions.commit()
+        return updated or row
