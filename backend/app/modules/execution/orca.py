@@ -284,6 +284,7 @@ async def _refresh_loop() -> None:
 # ---------------------------------------------------------------- 六原子动作（I04 起）
 
 SPAWN_TIMEOUT_SECONDS = 15.0
+HARVEST_TIMEOUT_SECONDS = 120.0  # 大 diff/大 transcript：收口允许慢，但不无限等
 SESSION_GONE_EXIT_CODE = 4  # 约定：会话不存在/已退出的退出码（adapter 吸收 CLI 方差）
 
 
@@ -385,3 +386,34 @@ class OrcaAdapter:
         cli = self._resolve_cli()
         args = [cli, "kill", "--json", "--session", session, "--mode", mode]
         await self._control(args, action="kill")
+
+    async def harvest(self, *, session: str) -> dict[str, Any]:
+        """收口：diff、日志、测试结果、成本（INTEGRATION-ORCA.md §4.3-4.4）。
+
+        返回 {"transcript_path": …, "cost": {"by_model": {…}}}；大 transcript 由
+        harvest 模块上传对象存储，本方法只回引用源路径，不回内容。
+        """
+        cli = self._resolve_cli()
+        args = [cli, "harvest", "--json", "--session", session]
+        result = await self._runner.run(args, timeout=HARVEST_TIMEOUT_SECONDS)
+        if result.rc != 0:
+            if _looks_like_session_gone(result):
+                raise OrcaSessionGone(
+                    f"`{self._cli_name} harvest` 发现会话已不存在（rc={result.rc}）"
+                )
+            raise OrcaCommandError(
+                f"`{self._cli_name} harvest` 失败（rc={result.rc}）：{result.stderr.strip()[:200]}"
+            )
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            # 契约锚点：harvest 输出格式变化必须给出明确错误
+            raise OrcaFormatError(
+                "Orca CLI 输出格式变了：harvest 结果不是 JSON"
+                f"（stdout={result.stdout.strip()[:120]!r}）"
+            ) from exc
+        if not isinstance(data, dict):
+            raise OrcaFormatError(
+                f"Orca CLI 输出格式变了：harvest 结果不是 JSON 对象（{type(data).__name__}）"
+            )
+        return data

@@ -8,10 +8,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import json
 import subprocess
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -22,6 +24,7 @@ from fastapi.testclient import TestClient
 
 from app.core.security import create_token
 from app.main import create_app
+from app.modules.execution import harvest as exec_harvest
 from app.modules.execution import orca as exec_orca
 from app.modules.execution import protocol as proto
 from app.modules.execution import service as exec_service
@@ -516,13 +519,21 @@ class TestTasksServiceGatewayContract:
 
 @dataclass
 class FakeOrcaRunner:
-    """按子命令返回预设输出的假 CLI。"""
+    """Orca CLI 假体：按子命令名（args 中的精确元素）返回预置结果。
+
+    delay>0 可模拟慢 harvest，验证「202 立即返回、收集后台执行」。
+    """
 
     outputs: dict[str, exec_orca.RunnerResult]
     calls: list[list[str]] = field(default_factory=list)
+    delay: float = 0.0
 
-    async def run(self, args: list[str], *, timeout: float = 5.0) -> exec_orca.RunnerResult:
+    async def run(
+        self, args: list[str], *, timeout: float = 5.0
+    ) -> exec_orca.RunnerResult:
         self.calls.append(args)
+        if self.delay:
+            await asyncio.sleep(self.delay)
         for key, result in self.outputs.items():
             if key in args:
                 return result
@@ -962,8 +973,10 @@ def control_client(
     *,
     available: bool = True,
     which: str | None = "/bin/orca",
+    artifact_root: Path | None = None,
+    open_stores=None,
 ) -> TestClient:
-    """I04 测试专用 App：probe 固定结果 + OrcaAdapter 挂假 CLI。"""
+    """I04/I05 测试专用 App：probe 固定结果 + OrcaAdapter 挂假 CLI。"""
     async def status(*, force=False):
         return exec_orca.OrcaProbeResult(
             available=available,
@@ -984,7 +997,33 @@ def control_client(
     app.dependency_overrides[exec_router.get_orca_adapter] = lambda: exec_orca.OrcaAdapter(
         runner, which=(lambda _: which)
     )
+    if artifact_root is not None:
+        app.dependency_overrides[exec_router.get_artifact_store] = lambda: (
+            exec_harvest.LocalArtifactStore(artifact_root)
+        )
+    if open_stores is not None:
+        app.dependency_overrides[exec_router.get_background_stores] = lambda: open_stores
     return TestClient(app)
+
+
+def fake_open_stores(sessions_store, events_store):
+    """后台 harvest 的 fake 装配：复用同一内存存储，方便断言最终状态。"""
+
+    @asynccontextmanager
+    async def _open():
+        yield sessions_store, events_store
+
+    return _open
+
+
+def wait_until(predicate, timeout: float = 3.0, interval: float = 0.02) -> bool:
+    """轮询等待后台任务完成（TestClient 的 portal 在 with 内持续运行）。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return predicate()
 
 
 def spawned_session(client: TestClient, **overrides) -> dict[str, Any]:
@@ -1361,3 +1400,239 @@ class TestSessionControl:
             == 401
         )
         assert c.post("/api/v1/execution/sessions/s-1/kill", json={}).status_code == 401
+
+
+# ================================================================ W06-I05 · harvest 归集
+
+class TestSummarizeNumstat:
+    def test_happy_path(self):
+        out = "3\t1\tbackend/app/x.py\n12\t0\tbackend/tests/test_x.py\n"
+        s = exec_harvest.summarize_numstat(out)
+        assert s.files_changed == 2
+        assert s.insertions == 15
+        assert s.deletions == 1
+        assert s.dirs == ("backend",)
+        assert s.files == ("backend/app/x.py", "backend/tests/test_x.py")
+
+    def test_binary_and_rename(self):
+        out = "-\t-\tassets/logo.png\n0\t5\tmain.py => src/main.py\n"
+        s = exec_harvest.summarize_numstat(out)
+        assert s.files_changed == 2
+        assert s.binary == 1
+        assert s.insertions == 0
+        assert s.deletions == 5
+        assert "src/main.py" in s.files
+        assert s.dirs == ("assets", "src")
+
+    def test_truncates_file_list(self):
+        out = "\n".join(f"1\t0\tdir/f{i}.py" for i in range(80))
+        s = exec_harvest.summarize_numstat(out)
+        assert s.files_changed == 80
+        assert len(s.files) == 50  # 行记录防撑爆：只留前 50 个
+
+
+class TestLocalArtifactStore:
+    async def test_put_text_writes_file_and_returns_ref(self, tmp_path):
+        store = exec_harvest.LocalArtifactStore(tmp_path / "art")
+        ref = await store.put_text(
+            "transcripts/T-0412/s-1.jsonl", '{"role": "user"}\n'
+        )
+        assert ref.startswith("file://")
+        path = Path(ref.removeprefix("file://"))
+        assert path.read_text(encoding="utf-8") == '{"role": "user"}\n'
+
+
+class TestOrcaAdapterHarvest:
+    async def test_harvest_parses_payload(self):
+        payload = {"transcript_path": "/tmp/t.jsonl", "cost": {"by_model": {"claude": 0.31}}}
+        runner = control_runner(
+            harvest=exec_orca.RunnerResult(rc=0, stdout=json.dumps(payload), stderr="")
+        )
+        adapter = exec_orca.OrcaAdapter(runner, which=lambda _: "/bin/orca")
+        assert await adapter.harvest(session="os-777") == payload
+
+    async def test_harvest_format_change_raises_explicitly(self):
+        runner = control_runner(
+            harvest=exec_orca.RunnerResult(rc=0, stdout="not json", stderr="")
+        )
+        adapter = exec_orca.OrcaAdapter(runner, which=lambda _: "/bin/orca")
+        with pytest.raises(exec_orca.OrcaFormatError, match="输出格式变了"):
+            await adapter.harvest(session="os-777")
+
+    async def test_harvest_session_gone(self):
+        runner = control_runner(
+            harvest=exec_orca.RunnerResult(rc=4, stdout="", stderr="no such session")
+        )
+        adapter = exec_orca.OrcaAdapter(runner, which=lambda _: "/bin/orca")
+        with pytest.raises(exec_orca.OrcaSessionGone):
+            await adapter.harvest(session="os-777")
+
+
+class TestSessionHarvest:
+    def test_harvest_collects_diff_transcript_and_cost(
+        self, monkeypatch, tmp_repo, sessions_store, events_store, gateway, tmp_path
+    ):
+        transcript = tmp_path / "transcript.jsonl"
+        transcript.write_text('{"role": "user"}\n', encoding="utf-8")
+        runner = control_runner(
+            harvest=exec_orca.RunnerResult(
+                rc=0,
+                stdout=json.dumps(
+                    {
+                        "transcript_path": str(transcript),
+                        "cost": {"by_model": {"claude": 0.31, "haiku": 0.02}},
+                    }
+                ),
+                stderr="",
+            )
+        )
+        c = control_client(
+            monkeypatch, tmp_repo, sessions_store, events_store, gateway, runner,
+            artifact_root=tmp_path / "artifacts",
+            open_stores=fake_open_stores(sessions_store, events_store),
+        )
+        with c:
+            session = spawned_session(c)
+            # Agent 的工作：往分支上提交一个文件（diff 即产物）
+            wt = Path(session["worktree_path"])
+            (wt / "backend" / "app").mkdir(parents=True)
+            (wt / "backend" / "app" / "feature.py").write_text("print('v1')\n", encoding="utf-8")
+            git_commit(wt, "feat")
+
+            r = c.post(
+                f"/api/v1/execution/sessions/{session['id']}/harvest", headers=AUTH
+            )
+            assert r.status_code == 202
+            assert r.json()["state"] == "harvesting"
+
+            sid = session["id"]
+            assert wait_until(
+                lambda: sessions_store.rows[sid].state == "harvested"
+            ), f"harvest 未完成，state={sessions_store.rows[sid].state}"
+
+            row = sessions_store.rows[sid]
+            # 验收 ①：diff 摘要入库
+            assert row.diff_summary["files_changed"] == 1
+            assert row.diff_summary["insertions"] == 1
+            assert row.diff_summary["dirs"] == ["backend"]
+            # 验收 ②：库里只存 transcript 引用，内容在对象存储
+            assert row.transcript_url and row.transcript_url.startswith("file://")
+            stored = Path(row.transcript_url.removeprefix("file://"))
+            assert stored.read_text(encoding="utf-8") == '{"role": "user"}\n'
+            assert "transcripts/T-0412" in row.transcript_url
+            # 验收 ③：成本按模型分项写 task_events（供 W07 归集）
+            kinds = events_store.kinds("T-0412")
+            assert kinds == [
+                "session.created", "session.spawned",
+                "session.harvesting", "session.harvested", "cost", "cost",
+            ]
+            models = [
+                e.payload["model"]
+                for e in events_store.rows
+                if e.task_id == "T-0412" and e.kind == "cost"
+            ]
+            assert models == ["claude", "haiku"]  # 按模型名排序分项
+
+    def test_harvest_is_async_and_does_not_block_request(
+        self, monkeypatch, tmp_repo, sessions_store, events_store, gateway, tmp_path
+    ):
+        """验收 ④：大 diff 不阻塞主流程——202 立即返回，收集后台完成。"""
+        runner = control_runner(delay=0.4)
+        c = control_client(
+            monkeypatch, tmp_repo, sessions_store, events_store, gateway, runner,
+            artifact_root=tmp_path / "artifacts",
+            open_stores=fake_open_stores(sessions_store, events_store),
+        )
+        with c:
+            session = spawned_session(c)
+            wt = Path(session["worktree_path"])
+            (wt / "feat.py").write_text("x = 1\n", encoding="utf-8")
+            git_commit(wt, "feat")
+
+            t0 = time.time()
+            r = c.post(
+                f"/api/v1/execution/sessions/{session['id']}/harvest", headers=AUTH
+            )
+            elapsed = time.time() - t0
+            assert r.status_code == 202
+            assert elapsed < 0.3  # 请求不等 harvest（runner 睡 0.4s）
+
+            sid = session["id"]
+            assert wait_until(
+                lambda: sessions_store.rows[sid].state == "harvested"
+            ), "后台 harvest 未完成"
+            assert sessions_store.rows[sid].diff_summary["files_changed"] == 1
+
+    def test_harvest_without_artifacts_fails_the_task(
+        self, monkeypatch, tmp_repo, sessions_store, events_store, gateway, tmp_path
+    ):
+        """无产物 → 判定失败：任务 failed（不重试）+ 租约释放。"""
+        runner = control_runner()  # harvest 输出空 → 无 transcript
+        c = control_client(
+            monkeypatch, tmp_repo, sessions_store, events_store, gateway, runner,
+            artifact_root=tmp_path / "artifacts",
+            open_stores=fake_open_stores(sessions_store, events_store),
+        )
+        with c:
+            session = spawned_session(c)  # 无任何提交 → diff 为空
+            r = c.post(
+                f"/api/v1/execution/sessions/{session['id']}/harvest", headers=AUTH
+            )
+            assert r.status_code == 202
+
+            sid = session["id"]
+            assert wait_until(
+                lambda: sessions_store.rows[sid].state == "failed"
+            ), "无产物判定未落库"
+
+            assert gateway.failed[0]["error_type"] == "no_artifacts"
+            assert gateway.failed[0]["retryable"] is False
+            assert (session["task_id"], sid) in gateway.released
+            assert sessions_store.rows[sid].error and "无产物" in sessions_store.rows[sid].error
+            assert events_store.kinds("T-0412")[-1] == "session.failed"
+
+    def test_harvest_rejects_bad_states(
+        self, monkeypatch, tmp_repo, sessions_store, events_store, gateway, tmp_path
+    ):
+        runner = control_runner(delay=0.4)
+        c = control_client(
+            monkeypatch, tmp_repo, sessions_store, events_store, gateway, runner,
+            artifact_root=tmp_path / "artifacts",
+            open_stores=fake_open_stores(sessions_store, events_store),
+        )
+        with c:
+            # created（未 spawn）：没有可收集的运行痕迹
+            created = c.post(
+                "/api/v1/execution/sessions",
+                headers=AUTH,
+                json=create_session_body(runtime="orca"),
+            ).json()
+            r = c.post(
+                f"/api/v1/execution/sessions/{created['id']}/harvest", headers=AUTH
+            )
+            assert r.status_code == 409
+            assert r.json()["error"]["code"] == "session_not_runnable"
+
+            # 收集中重复 harvest → 拒绝（换 slug 避开上一条的占用）
+            session = spawned_session(c, slug="state-check")
+            wt = Path(session["worktree_path"])
+            (wt / "feat.py").write_text("x = 1\n", encoding="utf-8")
+            git_commit(wt, "feat")
+            r1 = c.post(
+                f"/api/v1/execution/sessions/{session['id']}/harvest", headers=AUTH
+            )
+            r2 = c.post(
+                f"/api/v1/execution/sessions/{session['id']}/harvest", headers=AUTH
+            )
+            assert r1.status_code == 202
+            assert r2.status_code == 409
+
+    def test_harvest_requires_auth(
+        self, monkeypatch, tmp_repo, sessions_store, events_store, gateway, tmp_path
+    ):
+        c = control_client(
+            monkeypatch, tmp_repo, sessions_store, events_store, gateway, control_runner()
+        )
+        assert (
+            c.post("/api/v1/execution/sessions/s-1/harvest").status_code == 401
+        )

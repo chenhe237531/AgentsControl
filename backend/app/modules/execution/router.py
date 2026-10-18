@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.db import get_db
 from app.core.deps import OwnerDep
 from app.core.errors import NotImplementedYetError
+from app.modules.execution import harvest as exec_harvest
 from app.modules.execution import orca as exec_orca
 from app.modules.execution import protocol as proto
 from app.modules.execution import service as svc
@@ -95,6 +96,42 @@ def get_worktree_manager() -> exec_worktree.WorktreeManager:
 
 def get_orca_adapter() -> exec_orca.OrcaAdapter:
     return exec_orca.OrcaAdapter(exec_orca.CliRunner())
+
+
+def get_artifact_store() -> exec_harvest.ArtifactStore:
+    return exec_harvest.LocalArtifactStore(exec_harvest.default_artifacts_root())
+
+
+def get_background_stores() -> exec_harvest.StoresFactory:
+    """后台任务用独立 DB 会话（请求会话在响应返回后即关闭）。"""
+    return exec_harvest.sql_stores_factory()
+
+
+def get_harvest_service(
+    sessions: Annotated[SessionStore, Depends(get_session_store)],
+    events: Annotated[EventStore, Depends(get_event_store)],
+    tasks: Annotated[proto.TasksGateway, Depends(get_tasks_gateway)],
+    worktrees: Annotated[exec_worktree.WorktreeManager, Depends(get_worktree_manager)],
+    orca: Annotated[exec_orca.OrcaAdapter, Depends(get_orca_adapter)],
+    artifacts: Annotated[exec_harvest.ArtifactStore, Depends(get_artifact_store)],
+    open_stores: Annotated[
+        exec_harvest.StoresFactory, Depends(get_background_stores)
+    ],
+) -> exec_harvest.HarvestService:
+    return exec_harvest.HarvestService(
+        sessions=sessions,
+        events=events,
+        tasks=tasks,
+        worktrees=worktrees,
+        orca=orca,
+        artifacts=artifacts,
+        open_stores=open_stores,
+    )
+
+
+HarvestServiceDep = Annotated[
+    exec_harvest.HarvestService, Depends(get_harvest_service)
+]
 
 
 def get_session_service(
@@ -248,6 +285,23 @@ async def kill_session(
     service: SessionServiceDep,
 ) -> SessionView:
     row = await service.kill(session_id, body)
+    return _session_view(row)
+
+
+# ---------------------------------------------------------------- 归集（W06-I05）
+
+@router.post(
+    "/sessions/{session_id}/harvest",
+    status_code=202,
+    summary="收口会话：diff 摘要 + transcript 引用 + 分模型成本，202 受理后台执行",
+    response_model=SessionView,
+)
+async def harvest_session(
+    session_id: str,
+    _: OwnerDep,
+    service: HarvestServiceDep,
+) -> SessionView:
+    row = await service.start(session_id)
     return _session_view(row)
 
 

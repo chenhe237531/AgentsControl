@@ -29,6 +29,7 @@
 | POST | `/api/v1/execution/sessions/{id}/send` | 向 running 会话注入 prompt；会话已死 → 任务 failed + 租约释放 | W06-I04 |
 | POST | `/api/v1/execution/sessions/{id}/steer` | 人工闸门/纠偏（生命周期级指令） | W06-I04 |
 | POST | `/api/v1/execution/sessions/{id}/kill` | 终止会话并释放租约（kill 即释放；graceful 先 snapshot） | W06-I04 |
+| POST | `/api/v1/execution/sessions/{id}/harvest` | 收口：diff 摘要 + transcript 引用 + 分模型成本（202 后台执行） | W06-I05 |
 
 ## 认证
 

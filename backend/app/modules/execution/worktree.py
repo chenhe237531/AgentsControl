@@ -164,6 +164,10 @@ class WorktreeManager:
                 files.append(entry)
         return files
 
+    async def diff_numstat(self, path: str, *, base_ref: str) -> str:
+        """harvest 用：分支对基线的 numstat（三路点，容忍基线前移）。"""
+        return await _git(["diff", "--numstat", f"{base_ref}...HEAD"], cwd=path)
+
     async def remove(self, path: str, *, force: bool = False) -> None:
         """删除 worktree。force=True 才允许丢弃未提交改动。"""
         args = ["worktree", "remove"]
