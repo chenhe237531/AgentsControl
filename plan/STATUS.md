@@ -1,19 +1,19 @@
 # 窗口进度（自动生成）
 
-> 生成时间：2026-10-18 23:54　请勿手工编辑，运行 `./scripts/window-status.sh --write` 重建。
+> 生成时间：2026-10-19 02:37　请勿手工编辑，运行 `./scripts/window-status.sh --write` 重建。
 
 ### W01 · 身份、权限与工程内核
 
-- 分支：`win/w01-identity-kernel`　worktree：`.worktrees/w01-identity-kernel`　**未创建**
-- PR：PR #1 (Draft, checks: —)
+- 分支：`win/w01-identity-kernel`　worktree：`.worktrees/w01-identity-kernel`　存在
+- PR：PR #1 (MERGED, checks: ✓)
 
 | Issue | 标题 | Wave | 状态 | 最近提交 |
 |---|---|---|---|---|
-| W01-I01 | 登录与令牌轮换 | 1 | DONE | `5da7b04` |
-| W01-I02 | RBAC 与 scope 校验 | 2 | DONE | `fa710f7` |
-| W01-I03 | 会话与设备吊销联动 | 3 | DONE | `e9ec3ae` |
-| W01-I04 | 速率限制与安全响应头加固 | 3 | DONE | `f759cf4` |
-| W01-I05 | 工程内核补齐（错误码表与 OpenAPI 快照） | 4 | DONE | `5a9c1ff` |
+| W01-I01 | 登录与令牌轮换 | 1 | DONE | `0d1578b` |
+| W01-I02 | RBAC 与 scope 校验 | 2 | DONE | `621b76a` |
+| W01-I03 | 会话与设备吊销联动 | 3 | DONE | `2543403` |
+| W01-I04 | 速率限制与安全响应头加固 | 3 | DONE | `d7bff9a` |
+| W01-I05 | 工程内核补齐（错误码表与 OpenAPI 快照） | 4 | DONE | `9374b35` |
 
 **进度 5/5（100%）**
 
