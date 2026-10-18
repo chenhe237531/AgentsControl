@@ -85,11 +85,17 @@ func main() {
 		return
 	}
 
+	// wakeCh: heartbeat 检测到唤醒时发信号；snapshotLoop 收到后立即补快照
+	wakeCh := make(chan struct{}, 1)
+	// gate: snapshotReady 后才允许 flush 增量；启动时先发一次快照
+	gate := newSnapshotGate()
+
 	var wg sync.WaitGroup
-	wg.Add(3)
-	go func() { defer wg.Done(); heartbeatLoop(ctx, cfg, collector, client) }()
-	go func() { defer wg.Done(); flushLoop(ctx, cfg, buf, client) }()
-	go func() { defer wg.Done(); snapshotLoop(ctx, cfg, collector, client) }()
+	wg.Add(4)
+	go func() { defer wg.Done(); heartbeatLoop(ctx, cfg, collector, client, wakeCh) }()
+	go func() { defer wg.Done(); flushLoop(ctx, cfg, buf, client, gate) }()
+	go func() { defer wg.Done(); snapshotLoop(ctx, cfg, collector, client, gate, wakeCh) }()
+	go func() { defer wg.Done(); listenWakes(wakeCh, func() {}) }()
 
 	<-ctx.Done()
 	slog.Info("shutdown signal received, draining")
@@ -138,11 +144,22 @@ func runDryRun(ctx context.Context, buf buffer.Buffer) {
 	}
 }
 
-func heartbeatLoop(ctx context.Context, cfg *config.Config, c *collect.Collector, cl *transport.Client) {
+func heartbeatLoop(ctx context.Context, cfg *config.Config, c *collect.Collector, cl *transport.Client, wakeCh chan<- struct{}) {
 	ticker := time.NewTicker(cfg.HeartbeatInterval)
 	defer ticker.Stop()
 
+	detector := newWakeDetector(cfg.HeartbeatInterval)
+	signalWake := func() {
+		select {
+		case wakeCh <- struct{}{}:
+		default: // 已有未处理 wake 信号，不再压栈
+		}
+	}
+
 	send := func() {
+		if detector.observe(time.Now()) {
+			signalWake()
+		}
 		hb := c.Heartbeat(0, 0, 0)
 		if err := cl.Post(ctx, "/devices/heartbeat", hb); err != nil {
 			slog.Warn("heartbeat failed", "err", err)
@@ -162,7 +179,7 @@ func heartbeatLoop(ctx context.Context, cfg *config.Config, c *collect.Collector
 	}
 }
 
-func flushLoop(ctx context.Context, cfg *config.Config, buf buffer.Buffer, cl *transport.Client) {
+func flushLoop(ctx context.Context, cfg *config.Config, buf buffer.Buffer, cl *transport.Client, gate *snapshotGate) {
 	ticker := time.NewTicker(cfg.FlushInterval)
 	defer ticker.Stop()
 
@@ -171,6 +188,10 @@ func flushLoop(ctx context.Context, cfg *config.Config, buf buffer.Buffer, cl *t
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// 唤醒后必须等快照成功才能 flush 增量——避免老事件先到、快照覆盖矛盾
+			if !gate.wait(ctx.Done()) {
+				return
+			}
 			batch, err := buf.Peek(500)
 			if errors.Is(err, buffer.ErrEmpty) {
 				continue
@@ -192,17 +213,24 @@ func flushLoop(ctx context.Context, cfg *config.Config, buf buffer.Buffer, cl *t
 	}
 }
 
-func snapshotLoop(ctx context.Context, cfg *config.Config, c *collect.Collector, cl *transport.Client) {
+func snapshotLoop(ctx context.Context, cfg *config.Config, c *collect.Collector, cl *transport.Client, gate *snapshotGate, wakeCh <-chan struct{}) {
 	ticker := time.NewTicker(cfg.SnapshotInterval)
 	defer ticker.Stop()
 
+	// 启动即"唤醒"：先发快照再开 flush
 	send := func() {
-		snap := c.Snapshot(nil, "", -1)
+		// 快照发送前关闭 flush 通道（让 flushLoop 阻塞在 gate.wait）
+		probe := collect.NewOrcaProbe()
+		sessions := probe.Sessions(ctx)
+		orcaVer := probe.Version(ctx)
+		snap := c.Snapshot(sessions, orcaVer, -1)
 		if err := cl.Post(ctx, "/devices/snapshot", snap); err != nil {
-			slog.Warn("snapshot failed", "err", err)
+			slog.Warn("snapshot failed, incrementals blocked", "err", err)
 			return
 		}
-		slog.Info("snapshot sent")
+		slog.Info("snapshot sent, incrementals unblocked",
+			"sessions", len(sessions), "orca", orcaVer)
+		gate.markReady()
 	}
 
 	send()
@@ -210,7 +238,12 @@ func snapshotLoop(ctx context.Context, cfg *config.Config, c *collect.Collector,
 		select {
 		case <-ctx.Done():
 			return
+		case <-wakeCh:
+			// 唤醒：重置 gate（让 flush 阻塞），重发快照，再开 gate
+			gate.reset()
+			send()
 		case <-ticker.C:
+			gate.reset()
 			send()
 		}
 	}
