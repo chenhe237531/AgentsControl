@@ -40,7 +40,7 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
         try:
             response: Response = await call_next(request)
         finally:
-            for cvar, token in zip((request_id_var, task_id_var, node_id_var), tokens):
+            for cvar, token in zip((request_id_var, task_id_var, node_id_var), tokens, strict=False):
                 cvar.reset(token)
         elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
         response.headers["x-request-id"] = rid

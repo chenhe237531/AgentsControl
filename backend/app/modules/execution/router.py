@@ -14,7 +14,7 @@ Worker 协议 claim/heartbeat/complete/fail；Orca adapter 六原子动作；wor
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter
 
 from app.core.deps import OwnerDep
 from app.core.errors import NotImplementedYetError
