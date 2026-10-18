@@ -232,3 +232,213 @@ def test_malformed_login_body_is_422(h: Harness) -> None:
 
 def test_logout_requires_authentication(h: Harness) -> None:
     assert h.client.post("/api/v1/auth/logout").status_code == 401
+
+
+# ====================================================================== W01-I02 RBAC
+"""I02 用例：角色矩阵、越权 403、审计脚本能抓漏挂。
+
+失败路径（验收 ②③④）必须覆盖：
+- 越权 → 403 且 `error.code=forbidden`（不能是 401/404，前端靠 code 分支）
+- 未知角色 → 默认拒绝（不是「当 owner 处理」）
+- 写端点漏挂 scope → 审计脚本必须报出来（否则审计等于没跑）
+"""
+
+from typing import Annotated  # noqa: E402
+
+from fastapi import Depends, FastAPI  # noqa: E402
+
+from app.core.deps import Principal, get_current_owner  # noqa: E402
+from app.core.errors import register_exception_handlers  # noqa: E402
+from app.modules.identity.rbac import (  # noqa: E402
+    ALL_SCOPES,
+    ROLE_SCOPES,
+    ROLES,
+    expand,
+    has_scope,
+    missing_scopes,
+    require_scope,
+    scopes_for_role,
+)
+from app.modules.identity.scopes_audit import (  # noqa: E402
+    KIND_MISSING_AUTH,
+    KIND_MISSING_SCOPE,
+    check_role_table,
+    scan_app,
+)
+
+
+def _token(role: str, scopes: tuple[str, ...] = ()) -> dict[str, str]:
+    return _bearer(create_token(SUBJECT, "access", extra={"role": role, "scopes": list(scopes)}))
+
+
+def _write_app() -> FastAPI:
+    """一个只含写端点的小 App：用来验证 `require_scope` 的**实际接线**，不是纯函数。"""
+    app = FastAPI()
+    register_exception_handlers(app)
+
+    @app.post("/tasks")
+    async def create_task(
+        _: Annotated[Principal, Depends(require_scope("tasks:write"))],
+    ) -> dict[str, bool]:
+        return {"ok": True}
+
+    @app.get("/tasks")
+    async def list_tasks(_: Annotated[Principal, Depends(get_current_owner)]) -> dict[str, bool]:
+        return {"ok": True}
+
+    @app.post("/approvals")
+    async def approve(_: Annotated[Principal, Depends(require_scope("approvals:write"))]) -> dict[str, bool]:
+        return {"ok": True}
+
+    return app
+
+
+# ------------------------------------------------------------------ 角色矩阵
+def test_role_matrix_has_three_roles_and_owner_is_wildcard() -> None:
+    assert ROLES == ("owner", "operator", "viewer")
+    assert "*" in ROLE_SCOPES["owner"]
+    assert check_role_table() == []
+    # owner 展开后应拿到全部 scope（新增 scope 不需要记得改 owner）
+    assert expand(scopes_for_role("owner")) == frozenset(ALL_SCOPES)
+
+
+def test_viewer_is_read_only_but_can_logout() -> None:
+    scopes = scopes_for_role("viewer")
+    assert "tasks:read" in scopes
+    assert "tasks:write" not in scopes
+    assert "approvals:write" not in scopes
+    assert "auth:session" in scopes  # 登出是自助操作，不该要管理员权限
+
+
+def test_operator_cannot_approve_or_write_ledger() -> None:
+    """执行者不能自己给自己批预算——这是本窗口最重要的一条款。"""
+    assert has_scope("operator", (), "tasks:write")
+    assert not has_scope("operator", (), "approvals:write")
+    assert not has_scope("operator", (), "ledger:write")
+    assert not has_scope("operator", (), "evals:write")
+    assert missing_scopes("operator", (), ["tasks:write", "approvals:write"]) == ["approvals:write"]
+
+
+def test_unknown_role_gets_nothing() -> None:
+    assert scopes_for_role("superadmin") == frozenset()
+    assert not has_scope("superadmin", (), "tasks:read")
+    assert has_scope("superadmin", ("tasks:read",), "tasks:read")  # 显式授予仍生效
+
+
+def test_write_implies_read() -> None:
+    assert has_scope("operator", ("tasks:write",), "tasks:read")
+    # 反过来不成立：读权限不能推出写
+    assert not has_scope("viewer", ("tasks:read",), "tasks:write")
+
+
+# ------------------------------------------------------------------ 越权 403
+def test_write_endpoint_rejects_viewer_with_forbidden_code() -> None:
+    client = TestClient(_write_app())
+    r = client.post("/tasks", headers=_token("viewer"))
+    assert r.status_code == 403, r.text
+    body = r.json()["error"]
+    assert body["code"] == "forbidden"
+    assert body["details"]["required_scopes"] == ["tasks:write"]
+    assert "request_id" in body
+
+
+def test_write_endpoint_allows_operator_and_owner() -> None:
+    client = TestClient(_write_app())
+    assert client.post("/tasks", headers=_token("operator")).status_code == 200
+    assert client.post("/tasks", headers=_token("owner")).status_code == 200
+
+
+def test_missing_token_is_401_not_403() -> None:
+    """没带令牌是「没认证」（401），带了但不够权是「越权」（403）——两者前端处理不同。"""
+    client = TestClient(_write_app())
+    r = client.post("/tasks")
+    assert r.status_code == 401
+    assert r.json()["error"]["code"] == "unauthorized"
+
+
+def test_operator_cannot_hit_approvals() -> None:
+    client = TestClient(_write_app())
+    r = client.post("/approvals", headers=_token("operator"))
+    assert r.status_code == 403
+    assert r.json()["error"]["code"] == "forbidden"
+
+
+def test_read_endpoint_only_needs_auth() -> None:
+    client = TestClient(_write_app())
+    assert client.get("/tasks", headers=_token("viewer")).status_code == 200
+
+
+# ------------------------------------------------------------------ /auth/scopes
+def test_scopes_endpoint_exposes_matrix(h: Harness) -> None:
+    token = h.login()["access_token"]
+    r = h.client.get("/api/v1/auth/scopes", headers=_bearer(token))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["role"] == "owner"
+    assert set(body["roles"]) == {"owner", "operator", "viewer"}
+    assert body["all_scopes"] == list(ALL_SCOPES)
+    # owner 的 "*" 已展开：前端不该拿到通配符
+    assert "*" not in body["roles"]["owner"]
+    assert set(body["roles"]["owner"]) == set(ALL_SCOPES)
+
+
+def test_scopes_endpoint_requires_auth(h: Harness) -> None:
+    assert h.client.get("/api/v1/auth/scopes").status_code == 401
+
+
+def test_viewer_token_sees_only_read_scopes(h: Harness) -> None:
+    r = h.client.get("/api/v1/auth/scopes", headers=_token("viewer"))
+    assert r.status_code == 200
+    body = r.json()
+    assert "tasks:write" not in body["scopes"]
+    assert "tasks:read" in body["scopes"]
+
+
+def test_logout_requires_session_scope_not_admin(h: Harness) -> None:
+    """viewer 也能登出自己（回归：别把 auth:session 收进 owner 专属）。"""
+    token = h.login()["access_token"]
+    viewer_token = create_token(SUBJECT, "access", extra={"role": "viewer", "sid": "sess-x"})
+    assert h.client.post("/api/v1/auth/logout", headers=_bearer(viewer_token)).status_code == 204
+    assert h.client.post("/api/v1/auth/logout", headers=_bearer(token)).status_code == 204
+
+
+# ------------------------------------------------------------------ 审计脚本
+def test_audit_flags_unguarded_endpoints() -> None:
+    app = FastAPI()
+
+    @app.post("/open-write")
+    async def open_write() -> dict[str, bool]:
+        return {"ok": True}
+
+    @app.get("/open-read")
+    async def open_read() -> dict[str, bool]:
+        return {"ok": True}
+
+    @app.delete("/guarded-but-auth-only")
+    async def guarded(_: Annotated[Principal, Depends(get_current_owner)]) -> dict[str, bool]:
+        return {"ok": True}
+
+    report = scan_app(app)
+    kinds = {(v.kind, v.path) for v in report.violations}
+    assert (KIND_MISSING_AUTH, "/open-write") in kinds
+    assert (KIND_MISSING_AUTH, "/open-read") in kinds
+    assert (KIND_MISSING_SCOPE, "/guarded-but-auth-only") in kinds
+    assert not report.ok
+
+
+def test_audit_passes_on_real_app() -> None:
+    """真实 App 必须零违规：这是 CI 断言的那一条（W09 负责把它接进 ci.yml）。"""
+    report = scan_app(create_app())
+    assert report.ok, report.format_text()
+    assert report.total > 0  # 防止「扫到 0 个端点」这种假通过
+
+
+def test_audit_detects_unknown_scope_typo() -> None:
+    app = FastAPI()
+
+    @app.post("/typo")
+    async def typo(_: Annotated[Principal, Depends(require_scope("task:write"))]) -> dict[str, bool]:
+        return {"ok": True}
+
+    report = scan_app(app)
+    assert any(v.kind == "unknown_scope" for v in report.violations)

@@ -52,3 +52,21 @@ class MeResponse(BaseModel):
     scopes: list[str] = []
     email: str | None = None
     session_id: str | None = None
+
+
+class RoleScopes(BaseModel):
+    """一档角色的展开后 scope 列表。"""
+
+    role: str
+    scopes: list[str] = []
+
+
+class ScopesResponse(BaseModel):
+    """`GET /auth/scopes`：前端据此做按钮显隐，**不要**在前端硬编码角色判断。"""
+
+    role: str
+    scopes: list[str] = Field(default_factory=list, description="当前主体的有效 scopes")
+    roles: dict[str, list[str]] = Field(
+        default_factory=dict, description="角色 → 展开后 scopes（owner 为全部）"
+    )
+    all_scopes: list[str] = Field(default_factory=list, description="系统登记的全部 scope")

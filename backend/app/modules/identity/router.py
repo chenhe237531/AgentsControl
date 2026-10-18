@@ -6,20 +6,31 @@
 端点：
 - `POST /auth/login`    邮箱 + 密码 → 访问令牌（15 min）+ 刷新令牌（14 天）
 - `POST /auth/refresh`  刷新并**轮换**刷新令牌（旧 token 立即失效，重放吊销整条会话）
-- `POST /auth/logout`   吊销当前会话的刷新令牌
+- `POST /auth/logout`   吊销当前会话的刷新令牌（需 `auth:session`，三档角色都有）
 - `GET  /auth/me`       当前主体、角色与 scopes（W10 登录后首屏要用）
+- `GET  /auth/scopes`   角色 → scope 矩阵（前端据此显隐按钮，不硬编码角色）
+
+权限模型见 `rbac.py`：`require_scope()` 只能从这里导入，scope 字符串不要散落到各模块。
 """
 
 from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Header, Query, Request, Response, status
+from fastapi import APIRouter, Depends, Header, Query, Request, Response, status
 
-from app.core.deps import OwnerDep
+from app.core.deps import OwnerDep, Principal
 
 from .deps import ClaimsDep, IdentityServiceDep, client_ip_from_headers
-from .schemas import LoginRequest, LogoutRequest, MeResponse, RefreshRequest, TokenResponse
+from .rbac import ALL_SCOPES, effective_scopes, require_scope, role_matrix
+from .schemas import (
+    LoginRequest,
+    LogoutRequest,
+    MeResponse,
+    RefreshRequest,
+    ScopesResponse,
+    TokenResponse,
+)
 from .service import TokenPair
 
 MODULE = "identity"
@@ -71,7 +82,9 @@ async def refresh(payload: RefreshRequest, service: IdentityServiceDep) -> Token
     summary="登出（吊销当前会话的刷新令牌）",
 )
 async def logout(
-    principal: OwnerDep,
+    # `auth:session` 三档角色都有：登出是自助操作，不该要求管理员权限；
+    # 但它是写端点，必须挂 scope（否则审计脚本会把这里标成越权缺口）。
+    principal: Annotated[Principal, Depends(require_scope("auth:session"))],
     claims: ClaimsDep,
     service: IdentityServiceDep,
     payload: LogoutRequest | None = None,
@@ -94,6 +107,17 @@ async def me(principal: OwnerDep, claims: ClaimsDep) -> MeResponse:
         scopes=list(principal.scopes),
         email=(claims.get("email") or None),
         session_id=(claims.get("sid") or None),
+    )
+
+
+@router.get("/scopes", response_model=ScopesResponse, summary="角色 → scope 矩阵（前端显隐按钮用）")
+async def scopes_matrix(principal: OwnerDep) -> ScopesResponse:
+    # owner 的通配符在这里已经展开成具体列表，前端不需要理解 "*" 的语义
+    return ScopesResponse(
+        role=principal.role,
+        scopes=sorted(effective_scopes(principal.role, principal.scopes)),
+        roles=role_matrix(),
+        all_scopes=list(ALL_SCOPES),
     )
 
 
