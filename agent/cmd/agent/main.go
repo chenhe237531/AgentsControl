@@ -34,6 +34,16 @@ var (
 )
 
 func main() {
+	if len(os.Args) > 1 && (os.Args[1] == "install" || os.Args[1] == "uninstall") {
+		// 子命令分发：install / uninstall
+		switch os.Args[1] {
+		case "install":
+			os.Exit(runInstall(os.Args[2:]))
+		case "uninstall":
+			os.Exit(runUninstall())
+		}
+	}
+
 	showVersion := flag.Bool("version", false, "打印版本并退出")
 	dryRun := flag.Bool("dry-run", false, "只打印待发批次，不联网")
 	flag.Parse()

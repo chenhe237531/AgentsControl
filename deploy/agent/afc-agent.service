@@ -1,0 +1,14 @@
+[Unit]
+Description=AFC Agent (device side)
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/afc-agent
+# 占位：实际安装时由 `afc-agent install --env FILE` 注入 Environment= 行
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/afc-agent.out.log
+StandardError=append:/var/log/afc-agent.err.log
+
+[Install]
+WantedBy=default.target
