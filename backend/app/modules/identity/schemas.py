@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -70,3 +71,38 @@ class ScopesResponse(BaseModel):
         default_factory=dict, description="角色 → 展开后 scopes（owner 为全部）"
     )
     all_scopes: list[str] = Field(default_factory=list, description="系统登记的全部 scope")
+
+
+class SessionInfo(BaseModel):
+    """一个登录会话（同一 `session_id` 的令牌链聚合）。**不含任何令牌线索**。"""
+
+    session_id: str
+    current: bool = Field(default=False, description="是否是本次请求所用的会话")
+    active: bool = Field(description="仍有未吊销且未过期的令牌")
+    created_at: datetime
+    last_seen_at: datetime
+    expires_at: datetime
+    revoked_at: datetime | None = None
+    revoked_reason: str | None = Field(
+        default=None, description="logout / revoke_all / refresh_replayed / device_revoked"
+    )
+    client_ip: str | None = None
+    user_agent: str | None = None
+    token_count: int = 0
+
+
+class SessionsResponse(BaseModel):
+    sessions: list[SessionInfo] = Field(default_factory=list)
+    total: int = 0
+    active: int = 0
+
+
+class RevokeAllSessionsRequest(BaseModel):
+    keep_current: bool = Field(
+        default=True, description="true = 保留当前会话（「踢掉其它设备」），false = 连自己一起登出"
+    )
+
+
+class RevokeAllSessionsResponse(BaseModel):
+    revoked_sessions: int = Field(description="被吊销的会话数（不是令牌数）")
+    kept_session_id: str | None = None

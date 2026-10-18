@@ -1,10 +1,14 @@
-"""身份业务规则：登录、刷新（旋转）、登出、当前主体。
+"""身份业务规则：登录、刷新（旋转）、登出、会话吊销与事件流水。
 
-不可破坏的三条不变量（改代码前先读）：
+不可破坏的四条不变量（改代码前先读）：
 1. **刷新令牌每次使用都轮换**，旧 jti 立刻标记 `rotated_at`；
 2. 旧令牌被再次使用 = 重放 → **吊销整条会话链**（同 `session_id` 全部置 `revoked_at`），
    而不是只拒绝这一次请求；
-3. 刷新令牌**只存哈希**，库里拿不到可用的明文。
+3. 刷新令牌**只存哈希**，库里拿不到可用的明文；
+4. **吊销只作用于刷新令牌**：访问令牌是无状态 JWT，吊销后最多还能用
+   `access_token_ttl_seconds`（15 分钟）——这是刻意的取舍（每请求查库换不来这 15 分钟），
+   见 `docs/adr/0003-session-revocation.md`。要立刻失效必须等访问令牌自然过期，
+   或由网关加短 TTL 黑名单（未实现）。
 
 本层不依赖 FastAPI 的 Request/Response，只接受纯参数，因此可以脱离 HTTP 单测。
 """
@@ -21,8 +25,15 @@ from app.core.config import settings
 from app.core.errors import RateLimitedError, UnauthorizedError
 from app.core.security import TokenError, create_token, decode_token
 
+from .models import AUTH_EVENT_KINDS
 from .passwords import hash_password, hash_token, verify_password
-from .repository import Credential, IdentityRepository, RefreshRecord
+from .repository import (
+    AuthEventRecord,
+    Credential,
+    IdentityRepository,
+    RefreshRecord,
+    SessionRecord,
+)
 from .throttle import LOGIN_MAX_FAILURES, LOGIN_WINDOW_SECONDS, Throttle, failure_keys
 
 # 未知邮箱也跑一次同等代价的校验，避免用响应时间枚举账号是否存在。
@@ -77,6 +88,7 @@ class IdentityService:
             email=credential.email,
             client_ip=client_ip,
             user_agent=user_agent,
+            event="login",
         )
 
     # ------------------------------------------------------------------ 刷新
@@ -97,7 +109,7 @@ class IdentityService:
         now = datetime.now(UTC)
         if record.rotated_at is not None:
             # 重放：这个 jti 已经换过新令牌，又被拿来用 → 整链吊销
-            await self._revoke_chain(record.session_id, "refresh_replayed", now)
+            await self._revoke_chain(record.subject, record.session_id, "refresh_replayed", now)
             raise UnauthorizedError("刷新令牌已被使用，会话已吊销", code="refresh_replayed")
 
         if record.expires_at <= now:
@@ -106,7 +118,7 @@ class IdentityService:
         rotated = await self._repo.mark_rotated(jti, now)
         if not rotated:
             # 并发窗口：另一个请求抢先轮换了同一条记录，同样按重放处理
-            await self._revoke_chain(record.session_id, "refresh_replayed", now)
+            await self._revoke_chain(record.subject, record.session_id, "refresh_replayed", now)
             raise UnauthorizedError("刷新令牌已被使用，会话已吊销", code="refresh_replayed")
 
         scopes = payload.get("scopes") or []
@@ -120,13 +132,20 @@ class IdentityService:
             client_ip=record.client_ip,
             user_agent=record.user_agent,
             commit=False,
+            event="refresh",
         )
         await self._repo.commit()
         return pair
 
-    # ------------------------------------------------------------------ 登出
+    # ------------------------------------------------------------------ 登出 / 吊销
     async def logout(
-        self, *, session_id: str | None = None, refresh_token: str | None = None
+        self,
+        *,
+        session_id: str | None = None,
+        refresh_token: str | None = None,
+        subject: str | None = None,
+        client_ip: str | None = None,
+        user_agent: str | None = None,
     ) -> int:
         sid = session_id
         if refresh_token:
@@ -138,8 +157,49 @@ class IdentityService:
         if not sid:
             raise UnauthorizedError("缺少会话标识", code="invalid_token")
         revoked = await self._repo.revoke_session(sid, "logout", datetime.now(UTC))
+        await self._record_event(
+            subject or "",
+            "logout",
+            session_id=sid,
+            detail=f"revoked={revoked}",
+            client_ip=client_ip,
+            user_agent=user_agent,
+        )
         await self._repo.commit()
         return revoked
+
+    async def revoke_all_sessions(
+        self,
+        subject: str,
+        *,
+        keep_session_id: str | None = None,
+        reason: str = "revoke_all",
+        client_ip: str | None = None,
+        user_agent: str | None = None,
+    ) -> int:
+        """吊销该主体名下全部会话（可保留当前会话），返回被吊销的**会话**数。
+
+        `keep_session_id` 为真值时才排除它；调用方必须自己保证它属于该主体
+        （router 从已验签的 claims 取 `sid`，不接受请求体传入，避免越权销别人的会话）。
+        """
+        now = datetime.now(UTC)
+        revoked_sessions = await self._repo.revoke_subject_sessions(
+            subject, reason, now, except_session_id=keep_session_id
+        )
+        for sid in revoked_sessions:
+            await self._record_event(
+                subject,
+                "session_revoked",
+                session_id=sid,
+                detail=reason,
+                client_ip=client_ip,
+                user_agent=user_agent,
+            )
+        await self._repo.commit()
+        return len(revoked_sessions)
+
+    async def list_sessions(self, subject: str) -> list[SessionRecord]:
+        return await self._repo.list_sessions(subject)
 
     # ------------------------------------------------------------------ 内部
     def _decode_refresh(self, token: str) -> dict:
@@ -174,6 +234,7 @@ class IdentityService:
         client_ip: str | None = None,
         user_agent: str | None = None,
         commit: bool = True,
+        event: str | None = None,
     ) -> TokenPair:
         claims = {"role": role, "scopes": list(scopes), "sid": session_id, "email": email}
         access = create_token(subject, "access", extra=claims)
@@ -193,6 +254,14 @@ class IdentityService:
                 client_ip=(client_ip or None),
             )
         )
+        if event:
+            await self._record_event(
+                subject,
+                event,
+                session_id=session_id,
+                client_ip=client_ip,
+                user_agent=user_agent,
+            )
         if commit:
             await self._repo.commit()
         return TokenPair(
@@ -206,9 +275,39 @@ class IdentityService:
             scopes=scopes,
         )
 
-    async def _revoke_chain(self, session_id: str, reason: str, at: datetime) -> None:
+    async def _revoke_chain(
+        self, subject: str, session_id: str, reason: str, at: datetime
+    ) -> None:
         await self._repo.revoke_session(session_id, reason, at)
+        await self._record_event(subject, "refresh_replayed", session_id=session_id, detail=reason)
         await self._repo.commit()
+
+    async def _record_event(
+        self,
+        subject: str,
+        event: str,
+        *,
+        session_id: str | None = None,
+        detail: str | None = None,
+        client_ip: str | None = None,
+        user_agent: str | None = None,
+    ) -> None:
+        """写一条认证事件。事件名必须在白名单里——宁可写失败，也别让命名漂移。"""
+        if event not in AUTH_EVENT_KINDS:
+            raise ValueError(f"未知认证事件: {event!r}")
+        if not subject:
+            return  # 无主体的事件（例如脏令牌登出）没有审计价值，直接丢弃
+        await self._repo.record_event(
+            AuthEventRecord(
+                subject=subject,
+                event=event,
+                session_id=session_id,
+                detail=detail,
+                client_ip=client_ip,
+                user_agent=user_agent,
+                created_at=datetime.now(UTC),
+            )
+        )
 
     async def _assert_not_blocked(self, *keys: str) -> None:
         for key in keys:
