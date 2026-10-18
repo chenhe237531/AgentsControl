@@ -13,8 +13,18 @@ set -uo pipefail
 
 cd "$(dirname "$0")/.." || exit 1
 
-PYTHON="${PYTHON:-python3}"
-command -v "$PYTHON" >/dev/null 2>&1 || PYTHON=python
+# 需要一个带 PyYAML 的解释器；找不到就明确报错退出（绝不静默出一份空状态）
+PYTHON="${PYTHON:-}"
+if [[ -z "$PYTHON" ]]; then
+  for cand in python3 python "${VIRTUAL_ENV:-/nonexistent}/bin/python"       "/Users/nitai/.workbuddy/binaries/python/envs/default/bin/python"; do
+    [[ -z "$cand" ]] && continue
+    if "$cand" -c "import yaml" >/dev/null 2>&1; then PYTHON="$cand"; break; fi
+  done
+fi
+if [[ -z "$PYTHON" ]]; then
+  echo "未找到带 PyYAML 的 python。请 pip install pyyaml 或用 PYTHON=<path> 指定。" >&2
+  exit 1
+fi
 
 WATCH=0
 WRITE=0
