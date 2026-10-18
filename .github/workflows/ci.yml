@@ -131,21 +131,34 @@ jobs:
         working-directory: web
     steps:
       - uses: actions/checkout@v4
+      # 骨架期尚无 package-lock.json。setup-node 的 cache-dependency-path 一旦解析失败
+      # 会直接 ##[error] 让 job 变红（不是警告），因此按 lockfile 是否存在分两路：
+      # 有 lockfile → 启用 npm 缓存；没有 → 跳过缓存，仅装依赖。
+      - name: 探测 lockfile
+        id: lock
+        run: |
+          if [ -f package-lock.json ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::缺少 package-lock.json，本次不启用依赖缓存；W10 必须补交 lockfile"
+          fi
       - uses: actions/setup-node@v4
+        if: steps.lock.outputs.exists == 'true'
         with:
           node-version: ${{ env.NODE_VERSION }}
-          # 骨架期尚无 package-lock.json，此时不能开 npm 缓存：
-          # setup-node 会因 cache-dependency-path 解析失败而直接报错（不是警告）。
-          # W10 提交 lockfile 后，把下面两行恢复即可获得依赖缓存。
-          # cache: npm
-          # cache-dependency-path: web/package-lock.json
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - uses: actions/setup-node@v4
+        if: steps.lock.outputs.exists != 'true'
+        with:
+          node-version: ${{ env.NODE_VERSION }}
       - name: Install
         run: |
-          # 有 lockfile 必须用 ci（确定性）；骨架期未提交 lockfile 时退化为 install
+          # 有 lockfile 必须用 ci（确定性）；无 lockfile 时退化为 install
           if [ -f package-lock.json ]; then
             npm ci --no-audit --no-fund
           else
-            echo "::warning::缺少 package-lock.json，暂用 npm install；W10 必须补交 lockfile"
             npm install --no-audit --no-fund
           fi
       - name: Typecheck
