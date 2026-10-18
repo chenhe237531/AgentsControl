@@ -27,6 +27,7 @@ from fastapi import APIRouter, Depends, Header, Query, Request, Response, status
 
 from app.core.deps import OwnerDep, Principal
 from app.core.errors import UnauthorizedError
+from app.core.ratelimit import auth_rate_limit
 
 from .deps import ClaimsDep, IdentityServiceDep, client_ip_from_headers
 from .rbac import ALL_SCOPES, effective_scopes, require_scope, role_matrix
@@ -47,7 +48,14 @@ from .service import TokenPair
 MODULE = "identity"
 OWNER_WINDOW = "W01"
 
-router = APIRouter(prefix="/auth", tags=["identity"])
+router = APIRouter(
+    prefix="/auth",
+    tags=["identity"],
+    # 路由级守卫：`/auth/*` 全部端点在**解析入参之前**过一遍 IP + 主体双维度限流，
+    # 这样未认证的爆破请求也会被计数（端点级依赖挂在认证之后，挡不住爆破）。
+    # 桶与额度见 `app/core/ratelimit.py` 的规则表，本文件不写数字。
+    dependencies=[Depends(auth_rate_limit)],
+)
 
 
 def _token_response(pair: TokenPair) -> TokenResponse:

@@ -34,11 +34,15 @@ class AppError(Exception):
         code: str | None = None,
         status_code: int | None = None,
         details: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
     ) -> None:
         self.message = message or self.message
         self.code = code or self.code
         self.status_code = status_code or self.status_code
         self.details = details
+        # 少数错误需要响应头才能被客户端正确处理（如 429 的 Retry-After）；
+        # 默认 None，不改变其余错误的响应体/头。
+        self.headers = headers
         super().__init__(self.message)
 
 
@@ -96,6 +100,7 @@ def register_exception_handlers(app: FastAPI) -> None:
         return JSONResponse(
             status_code=exc.status_code,
             content=_payload(exc.code, exc.message, rid, exc.details),
+            headers=exc.headers,
         )
 
     @app.exception_handler(RequestValidationError)
