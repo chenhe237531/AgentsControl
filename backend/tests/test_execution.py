@@ -182,6 +182,31 @@ class FakeSessionStore:
                 return row
         return None
 
+    async def list_sessions(
+        self,
+        *,
+        state: str | None = None,
+        device_id: str | None = None,
+        objective_id: str | None = None,
+        runtime: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[SessionRow]:
+        rows = sorted(
+            self.rows.values(),
+            key=lambda r: (r.created_at or utcnow(), r.id),
+            reverse=True,
+        )
+        rows = [
+            r
+            for r in rows
+            if (state is None or r.state == state)
+            and (device_id is None or r.device_id == device_id)
+            and (objective_id is None or r.objective_id == objective_id)
+            and (runtime is None or r.runtime == runtime)
+        ]
+        return rows[offset : offset + limit]
+
     async def update(self, session_id: str, **fields: Any) -> SessionRow | None:
         row = self.rows.get(session_id)
         if row is None:
@@ -975,6 +1000,7 @@ def control_client(
     which: str | None = "/bin/orca",
     artifact_root: Path | None = None,
     open_stores=None,
+    langfuse_base: str | None = None,
 ) -> TestClient:
     """I04/I05 测试专用 App：probe 固定结果 + OrcaAdapter 挂假 CLI。"""
     async def status(*, force=False):
@@ -1003,6 +1029,8 @@ def control_client(
         )
     if open_stores is not None:
         app.dependency_overrides[exec_router.get_background_stores] = lambda: open_stores
+    if langfuse_base is not None:
+        app.dependency_overrides[exec_router.get_langfuse_base_url] = lambda: langfuse_base
     return TestClient(app)
 
 
@@ -1635,4 +1663,149 @@ class TestSessionHarvest:
         )
         assert (
             c.post("/api/v1/execution/sessions/s-1/harvest").status_code == 401
+        )
+
+
+# ================================================================ W06-I06 · 会话视图数据接口
+
+class TestSessionViewApi:
+    def test_list_sessions_with_filters(self, sessions_client):
+        def create(slug: str, **overrides) -> dict:
+            r = sessions_client.post(
+                "/api/v1/execution/sessions",
+                headers=AUTH,
+                json=create_session_body(slug=slug, **overrides),
+            )
+            assert r.status_code == 201
+            return r.json()
+
+        create("a", runtime="orca", device_id="d1", objective_id="O-1")
+        create("b", runtime="generic", device_id="d2", objective_id="O-1")
+        create("c", runtime="orca", device_id="d1", objective_id="O-2")
+
+        r = sessions_client.get("/api/v1/execution/sessions", headers=AUTH)
+        assert r.status_code == 200
+        body = r.json()
+        assert len(body["items"]) == 3
+        assert body["has_more"] is False
+        assert body["limit"] == 50 and body["offset"] == 0
+        # 新创建的在最前（created_at 倒序）
+        times = [i["created_at"] for i in body["items"]]
+        assert times == sorted(times, reverse=True)
+
+        def slugs(params: dict) -> set[str]:
+            rr = sessions_client.get(
+                "/api/v1/execution/sessions", headers=AUTH, params=params
+            )
+            assert rr.status_code == 200
+            return {i["slug"] for i in rr.json()["items"]}
+
+        assert slugs({"runtime": "orca"}) == {"a", "c"}
+        assert slugs({"device_id": "d1"}) == {"a", "c"}
+        assert slugs({"objective_id": "O-2"}) == {"c"}
+        assert slugs({"state": "created"}) == {"a", "b", "c"}
+        assert slugs({"device_id": "d1", "objective_id": "O-1"}) == {"a"}
+
+    def test_list_sessions_pagination(self, sessions_client):
+        for slug in ("p1", "p2", "p3"):
+            r = sessions_client.post(
+                "/api/v1/execution/sessions",
+                headers=AUTH,
+                json=create_session_body(slug=slug),
+            )
+            assert r.status_code == 201
+
+        page1 = sessions_client.get(
+            "/api/v1/execution/sessions", headers=AUTH, params={"limit": 2}
+        ).json()
+        page2 = sessions_client.get(
+            "/api/v1/execution/sessions",
+            headers=AUTH,
+            params={"limit": 2, "offset": 2},
+        ).json()
+        assert page1["has_more"] is True
+        assert len(page1["items"]) == 2
+        assert page2["has_more"] is False
+        assert len(page2["items"]) == 1
+        ids1 = {i["id"] for i in page1["items"]}
+        ids2 = {i["id"] for i in page2["items"]}
+        assert not (ids1 & ids2)  # 两页不重叠
+
+    def test_detail_returns_langfuse_url_and_events(
+        self, monkeypatch, tmp_repo, sessions_store, events_store, gateway
+    ):
+        """验收 ①：只给链接与前 20 条事件，不代理 Langfuse 内容。"""
+        c = control_client(
+            monkeypatch, tmp_repo, sessions_store, events_store, gateway,
+            control_runner(), langfuse_base="https://lf.example.com/",
+        )
+        session = spawned_session(c)
+        c.post(
+            f"/api/v1/execution/sessions/{session['id']}/send",
+            headers=AUTH,
+            json={"prompt": "step one"},
+        )
+        c.post(
+            f"/api/v1/execution/sessions/{session['id']}/send",
+            headers=AUTH,
+            json={"prompt": "step two"},
+        )
+        r = c.get(f"/api/v1/execution/sessions/{session['id']}", headers=AUTH)
+        assert r.status_code == 200
+        body = r.json()
+        # 链接按 task_id 拼，前端 iframe 嵌入
+        assert body["langfuse_url"] == "https://lf.example.com/trace/T-0412"
+        assert [e["kind"] for e in body["events"]] == [
+            "session.created", "session.spawned", "session.message", "session.message",
+        ]
+        assert body["events"][0]["source"] == "service"
+        assert body["events"][0]["session_id"] == session["id"]
+        assert body["events"][2]["payload"] == {"chars": 8, "files": []}
+
+    def test_detail_without_langfuse_base_returns_null_url(self, sessions_client):
+        created = sessions_client.post(
+            "/api/v1/execution/sessions", headers=AUTH, json=create_session_body()
+        ).json()
+        r = sessions_client.get(
+            f"/api/v1/execution/sessions/{created['id']}", headers=AUTH
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["langfuse_url"] is None  # 未配置 base_url 时不给假链接
+        assert [e["kind"] for e in body["events"]] == ["session.created"]
+
+    def test_detail_caps_events_at_20(
+        self, sessions_client, sessions_store, events_store
+    ):
+        created = sessions_client.post(
+            "/api/v1/execution/sessions", headers=AUTH, json=create_session_body()
+        ).json()
+        for i in range(25):
+            asyncio.run(
+                events_store.append(
+                    task_id="T-0412",
+                    kind="note",
+                    payload={"i": i},
+                    session_id=created["id"],
+                )
+            )
+        r = sessions_client.get(
+            f"/api/v1/execution/sessions/{created['id']}", headers=AUTH
+        )
+        events = r.json()["events"]
+        assert len(events) == 20  # 只取前 20 条（id 升序，最早的在前）
+        assert events[0]["kind"] == "session.created"
+        assert events[-1]["payload"] == {"i": 18}
+
+    def test_detail_unknown_session_404(self, sessions_client):
+        r = sessions_client.get(
+            "/api/v1/execution/sessions/s-nope", headers=AUTH
+        )
+        assert r.status_code == 404
+        assert r.json()["error"]["code"] == "session_not_found"
+
+    def test_view_endpoints_require_auth(self, sessions_client):
+        assert sessions_client.get("/api/v1/execution/sessions").status_code == 401
+        assert (
+            sessions_client.get("/api/v1/execution/sessions/s-1").status_code == 401
         )

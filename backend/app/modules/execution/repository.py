@@ -103,6 +103,16 @@ class SessionStore(Protocol):
     async def create(self, row: SessionRow) -> SessionRow: ...
     async def get(self, session_id: str) -> SessionRow | None: ...
     async def find_active_by_name(self, issue: str, slug: str) -> SessionRow | None: ...
+    async def list_sessions(
+        self,
+        *,
+        state: str | None = None,
+        device_id: str | None = None,
+        objective_id: str | None = None,
+        runtime: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[SessionRow]: ...
     async def update(self, session_id: str, **fields: Any) -> SessionRow | None: ...
     async def commit(self) -> None: ...
 
@@ -282,6 +292,34 @@ class SqlSessionStore:
         )
         row = (await self._session.execute(stmt)).scalars().first()
         return None if row is None else _session_row(row)
+
+    async def list_sessions(
+        self,
+        *,
+        state: str | None = None,
+        device_id: str | None = None,
+        objective_id: str | None = None,
+        runtime: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[SessionRow]:
+        """会话列表（W06-I06）：单条带索引的查询，给 <150ms 预算留足余量。"""
+        stmt = sa.select(models.ExecutionSession)
+        if state:
+            stmt = stmt.where(models.ExecutionSession.state == state)
+        if device_id:
+            stmt = stmt.where(models.ExecutionSession.device_id == device_id)
+        if objective_id:
+            stmt = stmt.where(models.ExecutionSession.objective_id == objective_id)
+        if runtime:
+            stmt = stmt.where(models.ExecutionSession.runtime == runtime)
+        stmt = (
+            stmt.order_by(models.ExecutionSession.created_at.desc())
+            .offset(offset)
+            .limit(limit)
+        )
+        rows = (await self._session.execute(stmt)).scalars().all()
+        return [_session_row(r) for r in rows]
 
     async def update(self, session_id: str, **fields: Any) -> SessionRow | None:
         row = await self._session.get(models.ExecutionSession, session_id)

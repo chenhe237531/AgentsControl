@@ -30,6 +30,8 @@
 | POST | `/api/v1/execution/sessions/{id}/steer` | 人工闸门/纠偏（生命周期级指令） | W06-I04 |
 | POST | `/api/v1/execution/sessions/{id}/kill` | 终止会话并释放租约（kill 即释放；graceful 先 snapshot） | W06-I04 |
 | POST | `/api/v1/execution/sessions/{id}/harvest` | 收口：diff 摘要 + transcript 引用 + 分模型成本（202 后台执行） | W06-I05 |
+| GET | `/api/v1/execution/sessions` | 会话列表：按状态/设备/目标/运行时过滤，分页（W10 数据源） | W06-I06 |
+| GET | `/api/v1/execution/sessions/{id}` | 会话详情：Langfuse 链接（iframe 嵌入）+ 前 20 条事件 | W06-I06 |
 
 ## 认证
 

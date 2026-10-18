@@ -22,9 +22,10 @@ from __future__ import annotations
 from dataclasses import asdict
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Response
+from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.db import get_db
 from app.core.deps import OwnerDep
 from app.core.errors import NotImplementedYetError
@@ -46,7 +47,10 @@ from app.modules.execution.schemas import (
     OrcaHealthView,
     SessionAck,
     SessionCreateRequest,
+    SessionDetailView,
+    SessionEventView,
     SessionKillRequest,
+    SessionListResponse,
     SessionSendRequest,
     SessionSpawnRequest,
     SessionSteerRequest,
@@ -303,6 +307,76 @@ async def harvest_session(
 ) -> SessionView:
     row = await service.start(session_id)
     return _session_view(row)
+
+
+# ---------------------------------------------------------------- 会话视图（W06-I06，供 W10 嵌 Langfuse）
+
+def get_langfuse_base_url() -> str:
+    return settings.langfuse_base_url
+
+
+def get_session_query_service(
+    sessions: Annotated[SessionStore, Depends(get_session_store)],
+    events: Annotated[EventStore, Depends(get_event_store)],
+) -> svc.SessionQueryService:
+    return svc.SessionQueryService(sessions=sessions, events=events)
+
+
+SessionQueryServiceDep = Annotated[
+    svc.SessionQueryService, Depends(get_session_query_service)
+]
+
+
+@router.get(
+    "/sessions",
+    summary="会话列表：按状态/设备/目标/运行时过滤（W10 会话视图数据源）",
+    response_model=SessionListResponse,
+)
+async def list_sessions(
+    _: OwnerDep,
+    service: SessionQueryServiceDep,
+    state: str | None = None,
+    device_id: str | None = None,
+    objective_id: str | None = None,
+    runtime: str | None = None,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> SessionListResponse:
+    rows, has_more = await service.list_sessions(
+        state=state,
+        device_id=device_id,
+        objective_id=objective_id,
+        runtime=runtime,
+        limit=limit,
+        offset=offset,
+    )
+    return SessionListResponse(
+        items=[_session_view(r) for r in rows],
+        limit=limit,
+        offset=offset,
+        has_more=has_more,
+    )
+
+
+@router.get(
+    "/sessions/{session_id}",
+    summary="会话详情：Langfuse 链接（iframe 嵌入）+ 前 20 条事件，不代理 Langfuse 内容",
+    response_model=SessionDetailView,
+)
+async def get_session(
+    session_id: str,
+    _: OwnerDep,
+    service: SessionQueryServiceDep,
+    base_url: Annotated[str, Depends(get_langfuse_base_url)],
+) -> SessionDetailView:
+    row, events, langfuse_url = await service.session_detail(
+        session_id, langfuse_base_url=base_url or None
+    )
+    return SessionDetailView(
+        **asdict(row),
+        langfuse_url=langfuse_url,
+        events=[SessionEventView(**asdict(e)) for e in events],
+    )
 
 
 # ---------------------------------------------------------------- Worker 协议（W06-I01）

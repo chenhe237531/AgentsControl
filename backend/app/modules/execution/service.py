@@ -515,3 +515,49 @@ class SessionService:
             payload={"reason": reason[:500], "retryable": True},
         )
         await self._sessions.commit()
+
+
+class SessionQueryService:
+    """会话视图数据 API（W06-I06，供 W10 嵌 Langfuse）。
+
+    只读、轻量：<150ms 预算下只做一次索引查询 + 一次事件查询（前 20 条）；
+    Langfuse 只给链接（前端 iframe 嵌入），本服务绝不代理其内容。
+    """
+
+    def __init__(self, *, sessions: SessionStore, events: EventStore) -> None:
+        self._sessions = sessions
+        self._events = events
+
+    async def list_sessions(
+        self,
+        *,
+        state: str | None = None,
+        device_id: str | None = None,
+        objective_id: str | None = None,
+        runtime: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[SessionRow], bool]:
+        """按状态/设备/目标过滤；多取一条判断 has_more，省掉 count 查询。"""
+        rows = await self._sessions.list_sessions(
+            state=state,
+            device_id=device_id,
+            objective_id=objective_id,
+            runtime=runtime,
+            limit=limit + 1,
+            offset=offset,
+        )
+        has_more = len(rows) > limit
+        return rows[:limit], has_more
+
+    async def session_detail(
+        self, session_id: str, *, langfuse_base_url: str | None
+    ) -> tuple[SessionRow, list, str | None]:
+        row = await self._sessions.get(session_id)
+        if row is None:
+            raise SessionNotFoundError(f"会话不存在：{session_id}")
+        events = await self._events.list_for_session(session_id, limit=20)
+        langfuse_url = None
+        if langfuse_base_url:
+            langfuse_url = f"{langfuse_base_url.rstrip('/')}/trace/{row.task_id}"
+        return row, events, langfuse_url

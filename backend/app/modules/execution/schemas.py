@@ -132,3 +132,33 @@ class SessionAck(BaseModel):
     task_id: str
     state: str
     accepted: bool = True
+
+
+# ---------------------------------------------------------------- 会话视图（W06-I06，供 W10）
+
+class SessionEventView(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    id: int
+    kind: str
+    session_id: str | None = None
+    worker_id: str | None = None
+    source: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime | None = None
+
+
+class SessionDetailView(SessionView):
+    """详情 = 会话本体 + Langfuse 链接 + 前 20 条事件（不代理 Langfuse 内容）。"""
+
+    langfuse_url: str | None = None
+    events: list[SessionEventView] = Field(default_factory=list)
+
+
+class SessionListResponse(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    items: list[SessionView]
+    limit: int
+    offset: int
+    has_more: bool
