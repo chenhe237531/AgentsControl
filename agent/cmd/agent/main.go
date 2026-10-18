@@ -12,9 +12,11 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -33,6 +35,7 @@ var (
 
 func main() {
 	showVersion := flag.Bool("version", false, "打印版本并退出")
+	dryRun := flag.Bool("dry-run", false, "只打印待发批次，不联网")
 	flag.Parse()
 
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -49,7 +52,11 @@ func main() {
 		os.Exit(2) // 配置错误用独立退出码，便于服务管理器区分
 	}
 
-	buf := buffer.NewMemory(10_000)
+	buf, err := openBuffer(cfg)
+	if err != nil {
+		slog.Error("open buffer", "err", err)
+		os.Exit(1)
+	}
 	client := transport.New(cfg.APIBaseURL, cfg.NodeID, cfg.Token)
 	collector := collect.New(cfg.NodeID, cfg.AgentVer)
 
@@ -58,8 +65,15 @@ func main() {
 
 	slog.Info("agent started",
 		"node", cfg.NodeID, "api", cfg.APIBaseURL, "version", cfg.AgentVer,
+		"buffer", cfg.BufferKind,
 		"heartbeat", cfg.HeartbeatInterval.String(), "flush", cfg.FlushInterval.String(),
 		"caps", collector.Caps())
+
+	if *dryRun {
+		runDryRun(ctx, buf)
+		_ = buf.Close()
+		return
+	}
 
 	var wg sync.WaitGroup
 	wg.Add(3)
@@ -77,6 +91,40 @@ func main() {
 		slog.Info("agent stopped cleanly")
 	case <-time.After(5 * time.Second):
 		slog.Warn("shutdown timeout, exiting with in-flight requests")
+	}
+	_ = buf.Close()
+}
+
+// openBuffer 按配置打开缓冲实现。SQLite 是生产路径；Memory 仅测试用。
+func openBuffer(cfg *config.Config) (buffer.Buffer, error) {
+	if cfg.BufferKind == "memory" {
+		return buffer.NewMemory(10_000), nil
+	}
+	path := cfg.BufferPath
+	if path == "" {
+		// 默认放状态目录下，与 next_seq 一起持久化
+		if err := os.MkdirAll(cfg.StatePath, 0o700); err != nil {
+			return nil, fmt.Errorf("create state dir: %w", err)
+		}
+		path = filepath.Join(cfg.StatePath, "buffer.db")
+	}
+	return buffer.NewSQLite(path, cfg.BufferMaxBytes, cfg.BufferMaxAge)
+}
+
+// runDryRun 打印待发批次与 dropped，便于调试"seq 重启不倒退"。
+func runDryRun(ctx context.Context, buf buffer.Buffer) {
+	batch, err := buf.Peek(500)
+	if err != nil {
+		slog.Info("dry-run: 缓冲为空", "err", err)
+		return
+	}
+	slog.Info("dry-run: 待发批次",
+		"from_seq", batch.FromSeq, "to_seq", batch.ToSeq,
+		"count", len(batch.Events), "dropped", batch.Dropped)
+	for i, ev := range batch.Events {
+		slog.Info("dry-run: event",
+			"i", i, "seq", batch.FromSeq+uint64(i),
+			"kind", ev.Kind, "task", ev.Task, "occur", ev.Occur)
 	}
 }
 

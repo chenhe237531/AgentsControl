@@ -22,6 +22,10 @@ type Config struct {
 	FlushInterval     time.Duration
 	SnapshotInterval  time.Duration
 
+	// BufferKind: "sqlite"（默认，断电不丢）或 "memory"（仅测试用）
+	BufferKind string
+	// BufferPath: SQLite 文件路径；空则用 StatePath/buffer.db
+	BufferPath string
 	BufferMaxBytes int64
 	BufferMaxAge   time.Duration
 
@@ -37,6 +41,8 @@ func Load() (*Config, error) {
 		HeartbeatInterval: durationEnv("AFC_HEARTBEAT_SECONDS", 60*time.Second),
 		FlushInterval:     durationEnv("AFC_FLUSH_SECONDS", 30*time.Second),
 		SnapshotInterval:  durationEnv("AFC_SNAPSHOT_SECONDS", 60*time.Minute),
+		BufferKind:        envOr("AFC_BUFFER_KIND", "sqlite"),
+		BufferPath:        os.Getenv("AFC_BUFFER_PATH"),
 		BufferMaxBytes:    int64Env("AFC_BUFFER_MAX_MB", 100) * 1024 * 1024,
 		BufferMaxAge:      7 * 24 * time.Hour,
 		StatePath:         envOr("AFC_STATE_PATH", defaultStatePath()),
@@ -59,6 +65,11 @@ func Load() (*Config, error) {
 	}
 	if c.FlushInterval <= 0 || c.SnapshotInterval <= 0 {
 		return nil, errors.New("间隔必须是正数")
+	}
+	switch c.BufferKind {
+	case "sqlite", "memory":
+	default:
+		return nil, fmt.Errorf("AFC_BUFFER_KIND 非法: %s（允许 sqlite/memory）", c.BufferKind)
 	}
 	return c, nil
 }
