@@ -1,0 +1,46 @@
+name: agent-release
+
+# W05-I05 打包发布。**只构建 agent 产物，不改 ci.yml 门禁**。
+# 触发：打 tag `afc-agent-v*` 时构建并发布 GitHub Release 草稿。
+on:
+  push:
+    tags:
+      - 'afc-agent-v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（如 v0.1.0）'
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache-dependency-path: agent/go.sum
+
+      - name: GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: latest
+          args: release --clean -f agent/.goreleaser.yaml
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 上传产物摘要
+        if: always()
+        run: |
+          echo "## Release 产物" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          ls -lh dist/ | tail -n +2 | awk '{printf "- %s\n", $0}' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**macOS 未签名**：用户首次运行需手动允许" >> $GITHUB_STEP_SUMMARY

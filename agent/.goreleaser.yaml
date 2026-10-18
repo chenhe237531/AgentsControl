@@ -1,0 +1,79 @@
+# GoReleaser 配置：afc-agent 跨平台打包。
+#
+# 关键约束：
+#   - 现代 Go 工具链内置 modernc.org/sqlite 的纯 Go 编译，无需 CGO
+#   - 三平台 amd64/arm64 产物 + checksums.txt
+#   - 版本号 ldflags 注入，afc-agent -version 输出正确
+#   - macOS 未签名：release notes 必须说明（不再静默）
+#   - W05 allow 不含根目录，所以 config 放 agent/ 下；workflow 通过 -f 指定
+project_name: afc-agent
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: afc-agent
+    main: ./cmd/agent
+    binary: afc-agent
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      # windows/arm64 实际部署少；保留支持，但仍构建（注释下面这行可禁用）
+      # - goos: windows
+      #   goarch: arm64
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.ShortCommit}}
+      - -X main.date={{.Date}}
+
+archives:
+  - id: default
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_
+      {{- if eq .Os "darwin" }}macos
+      {{- else if eq .Os "windows" }}windows
+      {{- else }}{{ .Os }}{{ end }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else }}{{ .Arch }}{{ end }}
+    formats: [ 'tar.gz' ]
+    format_overrides:
+      - goos: windows
+        formats: [ 'zip' ]
+    files:
+      - README.md
+      - LICENSE*
+
+checksum:
+  name_template: 'checksums.txt'
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  use: git
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+      - '^Merge pull request'
+
+release:
+  draft: true
+  name_template: "afc-agent {{ .Version }}"
+  header: |
+    ## afc-agent {{ .Version }}
+
+    **macOS 版本未签名**：首次运行需在系统设置 → 隐私与安全性中允许。
+    Linux/Windows 版本无需特殊处理。
