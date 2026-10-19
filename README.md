@@ -72,7 +72,9 @@ uvicorn app.main:app --reload --port 8000
 # curl localhost:8000/health → {"status":"ok",...}
 
 # 3) 前端
-cd web && npm install && npm run dev   # localhost:3000
+cd web && npm install
+cp web/.env.example web/.env.local   # 本地 dev 无同源反代，必须显式指向 :8000；勿提交
+npm run dev                          # localhost:3000
 
 # 4) 设备端
 cd agent && go build ./... && AFC_API_BASE_URL=http://localhost:8000/api/v1 \
