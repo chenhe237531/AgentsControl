@@ -1,6 +1,6 @@
 # S2 · 落库与事务（intake / goals）
 
-> 状态：REVIEW（2026-10-19，issue #24，分支 `win/s2-persistence`，PR 待合）
+> 状态：REVIEW（2026-10-19，issue #24，分支 `win/s2-persistence`，PR [#25](https://github.com/jackma3327/AgentsControl/pull/25) 待合；fork `chenhe237531/AgentsControl`，因当前账号对上游只读）
 > 来自 `docs/PRODUCT-REVIEW-2026-10-19.md` Issue 2（P0）、Issue 4 的后端部分。
 > 这是最独立的一条流：只碰两个模块目录，不依赖任何人，也不被任何人阻塞。
 
