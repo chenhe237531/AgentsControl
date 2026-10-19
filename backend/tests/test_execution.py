@@ -86,9 +86,16 @@ class FakeTasksGateway:
     released: list[tuple[str, str]] = field(default_factory=list)
     lease_calls: list[dict[str, Any]] = field(default_factory=list)
 
-    async def lease(self, *, capabilities: list[str], slots: int, machine: str | None):
+    async def lease(
+        self,
+        *,
+        capabilities: list[str],
+        slots: int,
+        machine: str | None,
+        worker: str | None = None,
+    ):
         self.lease_calls.append(
-            {"capabilities": capabilities, "slots": slots, "machine": machine}
+            {"capabilities": capabilities, "slots": slots, "machine": machine, "worker": worker}
         )
         return self.queue.pop(0) if self.queue else None
 
@@ -465,14 +472,26 @@ class TestWorkerProtocol:
 
 
 class TestTasksUnavailable:
-    def test_claim_reports_502_when_tasks_module_missing(self, workers_store, events_store):
-        """W03 未交付时的行为：明确 502 tasks_unavailable，绝不降级猜测。"""
+    def test_claim_reports_502_when_tasks_module_missing(self, workers_store, events_store, monkeypatch):
+        """tasks.service 缺失/破坏时的行为：明确 502 tasks_unavailable，绝不降级猜测。
+
+        W03 已合入 main，真实模块存在；这里用一个缺函数的假模块替换它，
+        验证的仍是同一条防线：网关拒绝在契约不满足时瞎猜。
+        """
+        import sys
+        import types
+
+        import app.modules.tasks as tasks_pkg
+
         app = create_app()
         app.dependency_overrides[exec_router.get_worker_store] = lambda: workers_store
         app.dependency_overrides[exec_router.get_event_store] = lambda: events_store
         app.dependency_overrides[exec_router.get_tasks_gateway] = (
             lambda: proto.TasksServiceGateway()
         )
+        broken = types.ModuleType("app.modules.tasks.service")  # 无任何公开函数
+        monkeypatch.setitem(sys.modules, "app.modules.tasks.service", broken)
+        monkeypatch.setattr(tasks_pkg, "service", broken, raising=False)
         with TestClient(app) as c:
             r = c.post(
                 "/api/v1/execution/workers/claim",
@@ -484,57 +503,198 @@ class TestTasksUnavailable:
 
 
 class TestTasksServiceGatewayContract:
-    """网关对 tasks.service 返回形态的防御性契约（W03 交付前锁定口径）。"""
+    """网关 ↔ tasks.service（main 上 W03 真实公开 API）的适配契约。
+
+    真实签名：claim(session, body) -> (Task, lease_seconds) | None；
+    heartbeat/complete/fail(session, task_id, *, lease_token, ...)。
+    租约栅栏靠 lease_token，由网关在 claim 时记录、续约/交货/失败时携带。
+    """
 
     @staticmethod
-    def _install_stub(monkeypatch, lease_return: Any) -> None:
+    def _install_stub(monkeypatch, claim_return: Any) -> dict[str, list]:
+        import sys
+        import types
+        import uuid as uuid_mod
+
+        import app.modules.tasks as tasks_pkg
+
+        calls: dict[str, list] = {"claim": [], "heartbeat": [], "complete": [], "fail": []}
+        state: dict[str, object] = {"task": None}
+
+        def _task_obj(task_id, *, token=None, expires=None):
+            return types.SimpleNamespace(
+                id=uuid_mod.UUID(task_id),
+                payload={"k": 1},
+                lease_token=uuid_mod.UUID(token) if token else None,
+                leased_until=expires or utcnow() + timedelta(seconds=90),
+            )
+
+        state["_task_obj"] = _task_obj
+        mod = types.ModuleType("app.modules.tasks.service")
+
+        async def claim(session, body, *, settings=None):
+            calls["claim"].append(body)
+            if claim_return is None:
+                return None
+            task_id, token = claim_return
+            task = _task_obj(task_id, token=token)
+            state["task"] = task
+            return task, 90
+
+        async def heartbeat(session, task_id, *, lease_token, settings=None):
+            calls["heartbeat"].append({"task_id": str(task_id), "lease_token": str(lease_token)})
+            task = state["task"]
+            return types.SimpleNamespace(
+                id=task_id, leased_until=utcnow() + timedelta(seconds=90)
+            )
+
+        async def complete(session, task_id, *, lease_token, result):
+            calls["complete"].append({"task_id": str(task_id), "result": result})
+            return state["task"]
+
+        async def fail(session, task_id, *, lease_token, error, retryable, settings=None):
+            calls["fail"].append({"task_id": str(task_id), "error": error, "retryable": retryable})
+            return state["task"]
+
+        mod.claim = claim
+        mod.heartbeat = heartbeat
+        mod.complete = complete
+        mod.fail = fail
+        # 必须同时替换 sys.modules 条目和包属性：`from app.modules.tasks import service`
+        # 优先取包属性，只换 sys.modules 会被真实模块抢先绑定而失效。
+        monkeypatch.setitem(sys.modules, "app.modules.tasks.service", mod)
+        monkeypatch.setattr(tasks_pkg, "service", mod, raising=False)
+
+        class _NullSession:
+            async def __aenter__(self):
+                return None
+
+            async def __aexit__(self, *exc):
+                return False
+
+        monkeypatch.setattr(proto, "_open_session", lambda: _NullSession())
+        proto._lease_tokens.clear()
+        return calls
+
+    @pytest.mark.asyncio
+    async def test_claim_maps_to_leased_task(self, monkeypatch):
+        import uuid as uuid_mod
+
+        task_id, token = str(uuid_mod.uuid4()), str(uuid_mod.uuid4())
+        calls = self._install_stub(monkeypatch, (task_id, token))
+        gw = proto.TasksServiceGateway()
+        leased = await gw.lease(
+            capabilities=["orca"], slots=1, machine="mac-studio", worker="w-1"
+        )
+        assert leased is not None
+        assert leased.task_id == task_id
+        assert leased.payload == {"k": 1}
+        # ClaimIn 映射：device_id 取 worker，caps 为 {能力: True}
+        assert calls["claim"][0].device_id == "w-1"
+        assert calls["claim"][0].caps == {"orca": True}
+        assert proto._lease_tokens[task_id] == token
+
+    @pytest.mark.asyncio
+    async def test_claim_none_returns_none(self, monkeypatch):
+        self._install_stub(monkeypatch, None)
+        gw = proto.TasksServiceGateway()
+        assert await gw.lease(capabilities=[], slots=1, machine=None) is None
+
+    @pytest.mark.asyncio
+    async def test_claim_rejects_garbage(self, monkeypatch):
         import sys
         import types
 
+        import app.modules.tasks as tasks_pkg
+
+        # 返回缺 id 的对象 → 拒绝，不把脏数据带进事件表
         mod = types.ModuleType("app.modules.tasks.service")
 
-        async def lease(*, capabilities, slots, machine):
-            return lease_return
+        async def claim(session, body, *, settings=None):
+            return object(), 90  # 无 id/payload 属性
 
-        async def renew_lease(*, task_id, worker):
-            return utcnow()
-
-        async def complete(*, task_id, worker, result):
+        async def heartbeat(session, task_id, *, lease_token):
             return None
 
-        async def fail(*, task_id, worker, error_type, retryable, context=None):
+        async def complete(session, task_id, *, lease_token, result):
             return None
 
-        mod.lease = lease
-        mod.renew_lease = renew_lease
-        mod.complete = complete
-        mod.fail = fail
+        async def fail(session, task_id, *, lease_token, error, retryable):
+            return None
+
+        mod.claim, mod.heartbeat, mod.complete, mod.fail = claim, heartbeat, complete, fail
         monkeypatch.setitem(sys.modules, "app.modules.tasks.service", mod)
-
-    @pytest.mark.asyncio
-    async def test_lease_accepts_dict_shape(self, monkeypatch):
-        self._install_stub(
-            monkeypatch, {"task_id": "T-1", "payload": {"k": 1}, "lease_expires_at": utcnow()}
-        )
-        gw = proto.TasksServiceGateway()
-        leased = await gw.lease(capabilities=[], slots=1, machine=None)
-        assert leased is not None
-        assert leased.task_id == "T-1"
-
-    @pytest.mark.asyncio
-    async def test_lease_rejects_garbage(self, monkeypatch):
-        self._install_stub(monkeypatch, {"payload": {}})  # 缺 task_id → 拒绝
+        monkeypatch.setattr(tasks_pkg, "service", mod, raising=False)
         gw = proto.TasksServiceGateway()
         with pytest.raises(proto.TasksUnavailableError):
             await gw.lease(capabilities=[], slots=1, machine=None)
+
+    @pytest.mark.asyncio
+    async def test_renew_uses_token_from_claim(self, monkeypatch):
+        import uuid as uuid_mod
+
+        task_id, token = str(uuid_mod.uuid4()), str(uuid_mod.uuid4())
+        calls = self._install_stub(monkeypatch, (task_id, token))
+        gw = proto.TasksServiceGateway()
+        await gw.lease(capabilities=[], slots=1, machine=None)
+        expires = await gw.renew_lease(task_id, worker="w-1")
+        assert isinstance(expires, datetime)
+        assert calls["heartbeat"][0]["lease_token"] == token
+
+    @pytest.mark.asyncio
+    async def test_renew_without_token_is_lease_lost(self, monkeypatch):
+        from app.core.errors import ConflictError
+
+        self._install_stub(monkeypatch, None)
+        gw = proto.TasksServiceGateway()
+        with pytest.raises(ConflictError) as exc_info:
+            await gw.renew_lease(str(__import__("uuid").uuid4()), worker="w-1")
+        assert exc_info.value.code == "lease_lost"
+
+    @pytest.mark.asyncio
+    async def test_complete_and_fail_consume_token(self, monkeypatch):
+        import uuid as uuid_mod
+
+        from app.core.errors import ConflictError
+
+        task_id, token = str(uuid_mod.uuid4()), str(uuid_mod.uuid4())
+        calls = self._install_stub(monkeypatch, (task_id, token))
+        gw = proto.TasksServiceGateway()
+        await gw.lease(capabilities=[], slots=1, machine=None)
+        await gw.complete(task_id, worker="w-1", result={"artifacts": []})
+        assert calls["complete"][0]["result"] == {"artifacts": []}
+        with pytest.raises(ConflictError):  # 终态后 token 已清除
+            await gw.complete(task_id, worker="w-1", result={})
+
+    @pytest.mark.asyncio
+    async def test_fail_carries_error_and_retryable(self, monkeypatch):
+        import uuid as uuid_mod
+
+        task_id, token = str(uuid_mod.uuid4()), str(uuid_mod.uuid4())
+        calls = self._install_stub(monkeypatch, (task_id, token))
+        gw = proto.TasksServiceGateway()
+        await gw.lease(capabilities=[], slots=1, machine=None)
+        await gw.fail(task_id, worker="w-1", error_type="boom", retryable=True, context={"x": 1})
+        assert calls["fail"][0]["error"].startswith("boom")
+        assert calls["fail"][0]["retryable"] is True
+
+    @pytest.mark.asyncio
+    async def test_invalid_task_uuid_rejected(self, monkeypatch):
+        self._install_stub(monkeypatch, None)
+        gw = proto.TasksServiceGateway()
+        with pytest.raises(proto.TasksUnavailableError):
+            await gw.renew_lease("not-a-uuid", worker="w-1")
 
     @pytest.mark.asyncio
     async def test_missing_service_functions_raise_unavailable(self, monkeypatch):
         import sys
         import types
 
+        import app.modules.tasks as tasks_pkg
+
         empty = types.ModuleType("app.modules.tasks.service")
         monkeypatch.setitem(sys.modules, "app.modules.tasks.service", empty)
+        monkeypatch.setattr(tasks_pkg, "service", empty, raising=False)
         gw = proto.TasksServiceGateway()
         with pytest.raises(proto.TasksUnavailableError):
             await gw.lease(capabilities=[], slots=1, machine=None)
@@ -1809,3 +1969,43 @@ class TestSessionViewApi:
         assert (
             sessions_client.get("/api/v1/execution/sessions/s-1").status_code == 401
         )
+
+
+# ================================================================ 启动清扫（服务重启恢复）
+
+class TestStartupSweep:
+    """fail_stale_running_sessions：上一进程遗留的 running 会话重启后标记 failed。"""
+
+    @staticmethod
+    def _row(sid: str, state: str) -> SessionRow:
+        return SessionRow(
+            id=sid,
+            task_id=f"t-{sid}",
+            issue="W06",
+            slug=sid,
+            branch=f"win/{sid}",
+            worktree_path=f"/tmp/wt-{sid}",
+            state=state,
+        )
+
+    async def test_running_marked_failed_with_event(self):
+        store = FakeSessionStore()
+        store.rows["s-live"] = self._row("s-live", "running")
+        store.rows["s-done"] = self._row("s-done", "recycled")
+        events = FakeEventStore()
+
+        n = await exec_service.fail_stale_running_sessions(store, events)
+
+        assert n == 1
+        assert store.rows["s-live"].state == "failed"
+        assert store.rows["s-live"].ended_at is not None
+        assert store.rows["s-done"].state == "recycled"  # 终态不动
+        kinds = [e.kind for e in events.rows if e.session_id == "s-live"]
+        assert kinds == ["session.failed"]
+
+    async def test_no_running_sessions_is_noop(self):
+        store = FakeSessionStore()
+        store.rows["s-x"] = self._row("s-x", "failed")
+        events = FakeEventStore()
+        assert await exec_service.fail_stale_running_sessions(store, events) == 0
+        assert events.rows == []

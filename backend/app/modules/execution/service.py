@@ -163,6 +163,23 @@ async def fail_stale_running_sessions(sessions: SessionStore, events: EventStore
     return len(rows)
 
 
+# 惰性启动清扫：backend/app/main.py 不属于任何窗口的 allow 列表（边界门禁），
+# 不能在 lifespan 挂钩；改为本模块首次被会话查询/创建触达时执行一次。
+_startup_sweep_done = False
+
+
+async def _ensure_startup_sweep(sessions: SessionStore, events: EventStore) -> None:
+    """进程生命周期内只跑一次；失败不阻塞业务（下次进程再扫）。"""
+    global _startup_sweep_done
+    if _startup_sweep_done:
+        return
+    _startup_sweep_done = True
+    try:
+        await fail_stale_running_sessions(sessions, events)
+    except Exception:  # noqa: BLE001 - 清扫失败不影响正常请求
+        logger.exception("execution 会话启动清扫失败（不影响本次请求）")
+
+
 class WorkerService:
     def __init__(self, *, workers: WorkerStore, events: EventStore, tasks: TasksGateway) -> None:
         self._workers = workers
@@ -190,6 +207,7 @@ class WorkerService:
             capabilities=list(req.capabilities),
             slots=req.concurrency_slots,
             machine=req.machine,
+            worker=worker_id,
         )
         if leased is None:
             await self._workers.commit()
@@ -318,6 +336,7 @@ class SessionService:
         幂等防重派：同 issue+slug 存在未回收会话，或同名 worktree 目录已存在，
         都拒绝（409），绝不产生第二个 worktree。
         """
+        await _ensure_startup_sweep(self._sessions, self._events)
         slug = req.slug or req.task_id
         existing = await self._sessions.find_active_by_name(req.issue, slug)
         if existing is not None:
@@ -586,6 +605,7 @@ class SessionQueryService:
         offset: int = 0,
     ) -> tuple[list[SessionRow], bool]:
         """按状态/设备/目标过滤；多取一条判断 has_more，省掉 count 查询。"""
+        await _ensure_startup_sweep(self._sessions, self._events)
         rows = await self._sessions.list_sessions(
             state=state,
             device_id=device_id,
