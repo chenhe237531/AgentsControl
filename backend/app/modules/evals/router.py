@@ -20,6 +20,9 @@ from app.modules.evals import service as svc
 from app.modules.evals.repository import EvalRepository, SqlEvalRepository, to_task_out
 from app.modules.evals.runner import execute_run, provider_for
 from app.modules.evals.schemas import (
+    CeilingCheckOut,
+    CeilingCheckRequest,
+    CeilingOut,
     Dimension,
     RadarOut,
     RunCreate,
@@ -223,3 +226,46 @@ async def get_radar(
     ] = None,
 ) -> RadarOut:
     return await svc.get_radar(repo, week=week, models=models)
+
+
+# ---------------------------------------------------------------------------
+# 能力上限与立项校验（W08-I03）
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/ceiling",
+    response_model=CeilingOut,
+    summary="8 维能力上限（全模型 < 70% 标 blocked，< 80% 标 risky）",
+)
+async def get_ceiling(
+    _: ReadDep,
+    repo: EvalsRepoDep,
+    week: Annotated[
+        str | None,
+        Query(description="ISO 周（2026-W42）或该周内任意日期；留空为本周", max_length=10),
+    ] = None,
+    models: Annotated[
+        list[str] | None,
+        Query(description="只关心这几个模型；留空为当周出现过的全部模型"),
+    ] = None,
+) -> CeilingOut:
+    return await svc.get_ceiling(repo, week=week, models=models)
+
+
+@router.post(
+    "/ceiling/check",
+    response_model=CeilingCheckOut,
+    summary="立项校验（W02 立项前调用）：返回具体维度与得分",
+)
+async def check_ceiling(
+    payload: CeilingCheckRequest,
+    _: ReadDep,
+    repo: EvalsRepoDep,
+) -> CeilingCheckOut:
+    """只读计算，不落库，因此挂 `evals:read` 而不是 `evals:write`。
+
+    POST 而非 GET 是因为 `dimensions` 是列表（GET 的数组参数在各客户端上行为不一致），
+    不是因为这里有副作用——同参数同窗口，结果必然相同。
+    """
+    return await svc.check_project(repo, payload)

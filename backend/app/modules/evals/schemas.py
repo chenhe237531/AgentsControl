@@ -183,9 +183,105 @@ class RadarOut(BaseModel):
     unknown_dimensions: list[str] = Field(default_factory=list)
 
 
+# ---------------------------------------------------------------------------
+# 能力上限与立项校验（W08-I03）：W02 立项界面直接引用这里的字段
+# ---------------------------------------------------------------------------
+
+#: `insufficient` 是刻意加的第四档：没测过 ≠ 做不到，也 ≠ 能做
+CeilingStatus = Literal["ok", "risky", "blocked", "insufficient"]
+
+#: 立项结论。`insufficient` 表示"有维度没数据，不能给你 ok"
+CeilingVerdict = Literal["ok", "risky", "blocked", "insufficient"]
+
+
+class CeilingAdvice(BaseModel):
+    """建议。`model_swap_would_help` 恒为 False——这是对"换模型就行"的显式否认。"""
+
+    action: Literal["go", "shrink", "cut", "add_tasks"]
+    headline: str
+    model_swap_would_help: bool = False
+    options: list[str] = Field(default_factory=list)
+
+
+class DimensionCeiling(BaseModel):
+    """单个维度的能力上限。`best_score` 是**最好的模型**的分数，不是均值。"""
+
+    dimension: str
+    label: str
+    status: CeilingStatus
+    best_model: str | None = None
+    best_score: float | None = None
+    samples: int = 0
+    models: dict[str, float | None] = Field(default_factory=dict)
+    threshold: float
+    #: 距 `threshold` 的差距（负数=已过线）。W02 用它显示"差 11.6 分"
+    gap: float | None = None
+    advice: CeilingAdvice
+
+
+class CeilingOut(BaseModel):
+    week: str
+    week_start: date
+    week_end: date
+    models: list[str] = Field(default_factory=list)
+    samples: int = 0
+    thresholds: dict[str, float] = Field(default_factory=dict)
+    dimensions: list[DimensionCeiling] = Field(default_factory=list)
+    blocked_dimensions: list[str] = Field(default_factory=list)
+    risky_dimensions: list[str] = Field(default_factory=list)
+    insufficient_dimensions: list[str] = Field(default_factory=list)
+
+
+class CeilingCheckRequest(BaseModel):
+    """立项校验入参。`dimensions` 留空 = 按整张雷达判断。
+
+    `dimensions` 刻意用 `list[str]` 而不是 `list[Dimension]`：Literal 校验只会回
+    "Input should be 'long_form'..."，而立项界面需要看到"你写的 telepathy 不认识，
+    合法值是这 8 个"。未知维度在 `ceiling.check_capability()` 里显式拒绝。
+    """
+
+    dimensions: list[str] | None = Field(
+        default=None, max_length=8, description="留空表示检查全部 8 维"
+    )
+    week: str | None = Field(default=None, max_length=10)
+    models: list[str] | None = None
+
+
+class CeilingCheckItem(BaseModel):
+    dimension: str
+    label: str
+    status: CeilingStatus
+    best_model: str | None = None
+    best_score: float | None = None
+    samples: int = 0
+    threshold: float
+    gap: float | None = None
+    advice: CeilingAdvice
+
+
+class CeilingCheckOut(BaseModel):
+    verdict: CeilingVerdict
+    week: str
+    requested: list[str] = Field(default_factory=list)
+    checked: list[CeilingCheckItem] = Field(default_factory=list)
+    #: 点名具体维度 + 得分，例如 "截图与视觉 68.4（m1 最好）"
+    blockers: list[str] = Field(default_factory=list)
+    unreliable: list[str] = Field(default_factory=list)
+    unknown: list[str] = Field(default_factory=list)
+    summary: str
+
+
 __all__ = [
     "DIMENSIONS",
+    "CeilingAdvice",
+    "CeilingCheckItem",
+    "CeilingCheckOut",
+    "CeilingCheckRequest",
+    "CeilingOut",
+    "CeilingStatus",
+    "CeilingVerdict",
     "Dimension",
+    "DimensionCeiling",
     "DimensionScore",
     "ModelDimensionScore",
     "RadarOut",

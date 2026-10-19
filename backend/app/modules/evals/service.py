@@ -10,12 +10,16 @@ from datetime import datetime
 
 from app.core.errors import ConflictError, ValidationError
 
+from .ceiling import build_ceiling, check_capability
 from .models import EvalRun, EvalTask
 from .radar import aggregate_radar, parse_week
 from .repository import EvalRepository, new_id, to_task_out
 from .runner import default_cost_cap_cny
 from .schemas import (
     DIMENSIONS,
+    CeilingCheckOut,
+    CeilingCheckRequest,
+    CeilingOut,
     RadarOut,
     ResultOut,
     RunCreate,
@@ -251,11 +255,42 @@ async def get_radar(
     return RadarOut.model_validate(payload)
 
 
+async def get_ceiling(
+    repo: EvalRepository,
+    *,
+    week: str | None = None,
+    models: list[str] | None = None,
+    now: datetime | None = None,
+) -> CeilingOut:
+    """一周的能力上限。与雷达同源同窗口，避免两处数字对不上。"""
+    stamp = now or datetime.utcnow()
+    window = parse_week(week, now=stamp)
+    samples = await repo.list_result_samples(start=window.start, end=window.end)
+    payload = build_ceiling(samples, window=window, models=models)
+    return CeilingOut.model_validate(payload)
+
+
+async def check_project(
+    repo: EvalRepository,
+    payload: CeilingCheckRequest,
+    *,
+    now: datetime | None = None,
+) -> CeilingCheckOut:
+    """立项校验：`GET /evals/ceiling` 的判定版，只回答"我这一步能不能做"。"""
+    ceiling = await get_ceiling(repo, week=payload.week, models=payload.models, now=now)
+    result = check_capability(
+        ceiling.model_dump(), requested=list(payload.dimensions or [])
+    )
+    return CeilingCheckOut.model_validate(result)
+
+
 __all__ = [
     "REQUIRED_PER_DIMENSION",
     "REQUIRED_TOTAL",
+    "check_project",
     "create_run",
     "create_task",
+    "get_ceiling",
     "get_radar",
     "get_run_detail",
     "list_tasks",

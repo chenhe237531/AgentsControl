@@ -23,6 +23,7 @@ from fastapi.testclient import TestClient
 from app.core.errors import NotFoundError, ValidationError
 from app.core.security import create_token
 from app.main import create_app
+from app.modules.evals.ceiling import ADVICE, build_ceiling, evaluate_dimension
 from app.modules.evals.models import EvalResult, EvalRun, EvalTask
 from app.modules.evals.radar import RadarSample, aggregate_radar, parse_week
 from app.modules.evals.repository import cache_key
@@ -708,3 +709,245 @@ def test_radar_aggregation_is_fast() -> None:
 
     assert out["samples"] == 100
     assert elapsed_ms < 200, f"聚合耗时 {elapsed_ms:.1f} ms，超过 200ms 验收线"
+
+
+# ---------------------------------------------------------------------------
+# W08-I03 · 能力上限标记与立项校验
+#
+# 验收映射：
+# ① 全模型 < 70% → blocked，其余 ok / risky（< 80%）→ test_ceiling_status_boundaries
+#    → 上限看 max 不看均值：test_ceiling_uses_best_model_not_average
+# ② 立项校验返回具体维度 + 得分 → test_check_reports_dimension_and_score
+# ③ 建议指向拆小/换规则/砍掉，不是换模型 → test_advice_never_suggests_switching_model
+# ④ 单测覆盖三种状态边界（69.9 / 70.1 / 79.9）→ test_ceiling_status_boundaries 的参数表
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("score", "expected"),
+    [
+        (0.0, "blocked"),
+        (69.9, "blocked"),  # 边界：差一点点也是 blocked
+        (70.0, "risky"),  # 左闭：刚好 70 就算"能跑但不稳"
+        (70.1, "risky"),
+        (79.9, "risky"),  # 边界：差一点点也进不了 ok
+        (80.0, "ok"),
+        (95.0, "ok"),
+    ],
+)
+def test_ceiling_status_boundaries(score: float, expected: str) -> None:
+    """三档阈值的边界表：69.9 / 70.0 / 70.1 / 79.9 / 80.0 分别是哪一档。"""
+    entry = evaluate_dimension("vision", per_model={"m1": score}, samples=2)
+    assert entry.status == expected
+
+
+def test_ceiling_uses_best_model_not_average() -> None:
+    """均值会把一个跑崩的模型算进来 → 误判整个方向不可行。
+
+    m1=60、m2=85：均值 72.5 会被判 risky，但真相是"m2 能做"——这是成本问题，不是能力问题。
+    """
+    entry = evaluate_dimension("code", per_model={"m1": 60.0, "m2": 85.0}, samples=4)
+    assert entry.status == "ok"
+    assert entry.best_model == "m2"
+    assert entry.best_score == 85.0
+
+
+def test_ceiling_best_model_tie_is_deterministic() -> None:
+    """并列最高分取模型名最小的：同一批数据两次调用必须给同样答案。"""
+    a = evaluate_dimension("code", per_model={"m2": 90.0, "m1": 90.0}, samples=4)
+    b = evaluate_dimension("code", per_model={"m1": 90.0, "m2": 90.0}, samples=4)
+    assert a.best_model == b.best_model == "m1"
+
+
+def test_ceiling_insufficient_keeps_score_none_not_zero() -> None:
+    """没测过 → insufficient + score=None；写成 0 会被下游读成"很差"从而误砍方向。"""
+    entry = evaluate_dimension("vision", per_model={"m1": None}, samples=0)
+    assert entry.status == "insufficient"
+    assert entry.best_score is None
+    assert entry.gap is None
+
+
+def test_advice_never_suggests_switching_model() -> None:
+    """验收 ③：全模型 < 80% 的建议是拆小/换规则/砍掉，绝不是"换模型"。"""
+    forbidden = ("换模型", "升级模型", "更强的模型", "更贵的模型", "换个模型")
+    for status in ("blocked", "risky", "ok", "insufficient"):
+        advice = ADVICE[status]
+        assert advice["model_swap_would_help"] is False, status
+        for option in advice["options"]:  # type: ignore[union-attr]
+            assert not any(word in option for word in forbidden), f"{status}: {option}"
+
+
+def test_build_ceiling_groups_dimensions_by_status() -> None:
+    """一次构建里同时出现 blocked / risky / ok / insufficient 四种维度。"""
+    samples = [
+        RadarSample("vision", "m1", 68.4, 0.004, 260),  # blocked
+        RadarSample("tool_call", "m1", 74.0, 0.003, 300),  # risky
+        RadarSample("code", "m1", 88.0, 0.002, 120),  # ok
+    ]
+    out = build_ceiling(samples, window=parse_week(WEEK, now=NOW))
+    assert out["blocked_dimensions"] == ["vision"]
+    assert out["risky_dimensions"] == ["tool_call"]
+    assert len(out["insufficient_dimensions"]) == 5
+    assert out["thresholds"] == {"blocked_below": 70.0, "risky_below": 80.0}
+
+    dims = {d["dimension"]: d for d in out["dimensions"]}  # type: ignore[index]
+    assert dims["vision"]["best_score"] == 68.4
+    assert dims["vision"]["gap"] == 11.6, "68.4 距 80 分线差 11.6"
+    assert dims["code"]["gap"] == -8.0, "已过线时 gap 为负"
+
+
+def test_ceiling_endpoint_returns_eight_dimensions(
+    client: TestClient, repo: FakeEvalRepo
+) -> None:
+    _put_sample(repo, dimension="code", model="m1", score=88, cost=0.002, latency=120)
+    _put_sample(repo, dimension="vision", model="m1", score=68.4, cost=0.004, latency=260)
+
+    r = client.get(f"/api/v1/evals/ceiling?week={WEEK}", headers=AUTH)
+    assert r.status_code == 200, r.text
+    body = r.json()
+
+    assert body["week"] == "2026-W42"
+    assert body["samples"] == 2
+    assert len(body["dimensions"]) == 8
+    assert body["blocked_dimensions"] == ["vision"]
+    assert body["risky_dimensions"] == []
+
+    dims = {d["dimension"]: d for d in body["dimensions"]}
+    assert dims["code"]["status"] == "ok"
+    assert dims["code"]["best_model"] == "m1"
+    assert dims["vision"]["status"] == "blocked"
+    assert dims["vision"]["advice"]["action"] == "cut"
+    assert dims["tool_call"]["status"] == "insufficient"
+    assert dims["tool_call"]["best_score"] is None
+
+
+def test_ceiling_endpoint_rejects_bad_week(client: TestClient) -> None:
+    r = client.get("/api/v1/evals/ceiling?week=oops", headers=AUTH)
+    assert r.status_code == 422
+
+
+def test_ceiling_endpoint_requires_read_scope(client: TestClient) -> None:
+    assert client.get(f"/api/v1/evals/ceiling?week={WEEK}").status_code in (401, 403)
+
+
+def test_check_reports_dimension_and_score(client: TestClient, repo: FakeEvalRepo) -> None:
+    """验收 ②：不能说"可能不行"，必须给维度名 + 得分 + 好模型是谁。"""
+    _put_sample(repo, dimension="vision", model="m1", score=68.4, cost=0.004, latency=260)
+
+    r = client.post(
+        "/api/v1/evals/ceiling/check",
+        json={"dimensions": ["vision"], "week": WEEK},
+        headers=AUTH,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+
+    assert body["verdict"] == "blocked"
+    assert body["requested"] == ["vision"]
+    assert body["blockers"] == ["截图与视觉 68.4（m1 最好）"]
+    assert "68.4" in body["summary"]
+    assert body["checked"][0]["best_score"] == 68.4
+    assert body["checked"][0]["gap"] == 11.6
+    assert body["checked"][0]["advice"]["action"] == "cut"
+    assert body["checked"][0]["advice"]["model_swap_would_help"] is False
+
+
+def test_check_risky_verdict_advises_shrinking_scope(
+    client: TestClient, repo: FakeEvalRepo
+) -> None:
+    """70–80 分：能做但不稳 → 建议缩范围 + 加闸门，而不是"换个更贵的模型"。"""
+    _put_sample(repo, dimension="long_form", model="m1", score=76.5, cost=0.006, latency=900)
+
+    body = client.post(
+        "/api/v1/evals/ceiling/check",
+        json={"dimensions": ["long_form"], "week": WEEK},
+        headers=AUTH,
+    ).json()
+
+    assert body["verdict"] == "risky"
+    assert body["unreliable"] == ["长文写作 76.5（m1 最好）"]
+    assert body["checked"][0]["advice"]["action"] == "shrink"
+
+
+def test_check_ok_when_best_model_clears_80(client: TestClient, repo: FakeEvalRepo) -> None:
+    _put_sample(repo, dimension="code", model="m1", score=61, cost=0.002, latency=100)
+    _put_sample(repo, dimension="code", model="m2", score=86, cost=0.002, latency=100)
+
+    body = client.post(
+        "/api/v1/evals/ceiling/check",
+        json={"dimensions": ["code"], "week": WEEK},
+        headers=AUTH,
+    ).json()
+
+    assert body["verdict"] == "ok"
+    assert body["checked"][0]["best_model"] == "m2"
+    assert body["checked"][0]["advice"]["action"] == "go"
+
+
+def test_check_only_judges_requested_dimensions(
+    client: TestClient, repo: FakeEvalRepo
+) -> None:
+    """代码可以、视觉不行：只问代码时必须给 ok——立项校验关心的是自己那一步。"""
+    _put_sample(repo, dimension="code", model="m1", score=90, cost=0.002, latency=100)
+    _put_sample(repo, dimension="vision", model="m1", score=50, cost=0.004, latency=260)
+
+    only_code = client.post(
+        "/api/v1/evals/ceiling/check",
+        json={"dimensions": ["code"], "week": WEEK},
+        headers=AUTH,
+    ).json()
+    assert only_code["verdict"] == "ok"
+    assert [c["dimension"] for c in only_code["checked"]] == ["code"]
+
+    both = client.post(
+        "/api/v1/evals/ceiling/check",
+        json={"dimensions": ["code", "vision"], "week": WEEK},
+        headers=AUTH,
+    ).json()
+    assert both["verdict"] == "blocked", "任一所问维度 blocked，整体就是 blocked"
+
+
+def test_check_never_returns_ok_for_untested_dimension(
+    client: TestClient, repo: FakeEvalRepo
+) -> None:
+    """没数据的维度不能担保"能做"：verdict 是 insufficient，不是 ok。"""
+    body = client.post(
+        "/api/v1/evals/ceiling/check",
+        json={"dimensions": ["zh_nuance"], "week": WEEK},
+        headers=AUTH,
+    ).json()
+
+    assert body["verdict"] == "insufficient"
+    assert body["unknown"] == ["zh_nuance"]
+    assert "缺数据" in body["summary"]
+
+
+def test_check_rejects_unknown_dimension(client: TestClient) -> None:
+    """不存在的维度必须 422 并列出合法维度，不能静默返回 ok。"""
+    r = client.post(
+        "/api/v1/evals/ceiling/check",
+        json={"dimensions": ["telepathy"], "week": WEEK},
+        headers=AUTH,
+    )
+    assert r.status_code == 422
+    detail = r.json()["error"]["details"]
+    assert detail["unknown_dimensions"] == ["telepathy"]
+    assert "code" in detail["known_dimensions"]
+
+
+def test_check_without_dimensions_checks_all_eight(
+    client: TestClient, repo: FakeEvalRepo
+) -> None:
+    _put_sample(repo, dimension="code", model="m1", score=90, cost=0.002, latency=100)
+
+    body = client.post(
+        "/api/v1/evals/ceiling/check", json={"week": WEEK}, headers=AUTH
+    ).json()
+
+    assert len(body["checked"]) == 8
+    assert body["verdict"] == "insufficient", "其余 7 维没数据，不能给 ok"
+
+
+def test_check_requires_auth(client: TestClient) -> None:
+    r = client.post("/api/v1/evals/ceiling/check", json={"week": WEEK})
+    assert r.status_code in (401, 403)
