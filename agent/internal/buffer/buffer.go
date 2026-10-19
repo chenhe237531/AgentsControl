@@ -16,6 +16,10 @@ import (
 
 var ErrEmpty = errors.New("buffer empty")
 
+// ErrDiskPressure 磁盘水位 > 90% 时 Append 返回此错误。
+// 调用方应上报 disk_pressure 事件并停止写入，直到水位恢复。
+var ErrDiskPressure = errors.New("disk pressure")
+
 type Buffer interface {
 	Seq() uint64
 	Append(events ...protocol.Event) (fromSeq, toSeq uint64, err error)
