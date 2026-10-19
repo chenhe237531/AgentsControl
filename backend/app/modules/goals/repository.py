@@ -48,6 +48,15 @@ class GoalRepository(Protocol):
     async def mark_intake_promoted(self, intake_item_id: str, goal_id: str, at: datetime) -> None:
         ...
 
+    async def commit(self) -> None:
+        """提交当前事务。service 写路径末尾显式调用（S2/R04）。
+
+        背景：`core/db.py#get_db()` 语义是"业务层不 commit"，goals 的
+        create/update 只 flush，导致 POST 201 / PATCH 200 后数据静默丢失。
+        提交权归 service 层；repository 的写方法仍只负责 flush。
+        """
+        ...
+
 
 class SqlGoalRepository:
     def __init__(self, session: AsyncSession) -> None:
@@ -131,6 +140,9 @@ class SqlGoalRepository:
             .values(status="promoted", promoted_goal_id=goal_id)
         )
         await self._s.execute(stmt)
+
+    async def commit(self) -> None:
+        await self._s.commit()
 
 
 def new_id() -> str:
