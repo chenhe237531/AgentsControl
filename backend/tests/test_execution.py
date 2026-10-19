@@ -329,9 +329,15 @@ class TestWorkerProtocol:
         assert body["task"]["task_id"] == "T-0412"
         assert body["worker_id"] == "w-mac-mini-1"
         assert body["lease_expires_at"]
-        # 领活语义：任务派给了正确的能力标签与机型
+        # 领活语义：任务派给了正确的能力标签与机型；worker 身份随领取传递
+        # （W03 契约对齐后 device_id 取 worker）
         assert gateway.lease_calls == [
-            {"capabilities": ["orca", "has_gui"], "slots": 4, "machine": "mac-mini-m4"}
+            {
+                "capabilities": ["orca", "has_gui"],
+                "slots": 4,
+                "machine": "mac-mini-m4",
+                "worker": "w-mac-mini-1",
+            }
         ]
         assert events_store.kinds("T-0412") == ["claimed"]
         assert workers_store.rows["w-mac-mini-1"].capabilities == ("orca", "has_gui")
