@@ -22,7 +22,7 @@ from app.core.security import create_token
 from app.main import create_app
 from app.modules.goals import service as gsvc
 from app.modules.goals.models import Goal
-from app.modules.goals.repository import new_id
+from app.modules.goals.repository import new_id, to_out
 from app.modules.goals.router import get_goals_repository
 from app.modules.goals.rules import (
     assert_transition,
@@ -828,3 +828,66 @@ def test_check_stop_loss_commits_only_when_triggered(fake_repo: FakeGoalRepo) ->
         assert fake_repo.commit_calls == 1, "未触发不应产生提交"
 
     asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# to_out 归一化（CODE-REVIEW P1-1 / issue #37：脏数据不打 500）
+# ---------------------------------------------------------------------------
+
+
+def _goal(**overrides) -> Goal:
+    base = dict(
+        id=new_id(),
+        code="O-M-20261019-001",
+        owner_subject=OWNER,
+        track="money",
+        template="",
+        title="测试目标",
+        acceptance="可验收",
+        status="draft",
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    base.update(overrides)
+    return Goal(**base)
+
+
+def test_to_out_wraps_legacy_array_json_columns() -> None:
+    """历史库里 guardrails/deliverables 是数组时归一成 {"items": [...]}。
+
+    GoalOut 契约是 dict[str, Any] | None；修复前一条脏数据让
+    GET /goals/ 整个列表 500（CODE-REVIEW P1-1）。
+    """
+    goal = _goal(guardrails=["不碰灰产渠道"], deliverables=["20 篇内容"])
+    out = to_out(goal)
+    assert out.guardrails == {"items": ["不碰灰产渠道"]}
+    assert out.deliverables == {"items": ["20 篇内容"]}
+
+
+def test_to_out_keeps_dict_and_none() -> None:
+    """dict 原样、None 原样——正常数据零变化。"""
+    goal = _goal(guardrails={"违规": 0}, deliverables=None)
+    out = to_out(goal)
+    assert out.guardrails == {"违规": 0}
+    assert out.deliverables is None
+
+
+def test_to_out_wraps_scalar_json_columns() -> None:
+    """标量脏数据也不炸（包成 {"value": ...}）。"""
+    goal = _goal(guardrails="写坏了", deliverables=42)
+    out = to_out(goal)
+    assert out.guardrails == {"value": "写坏了"}
+    assert out.deliverables == {"value": 42}
+
+
+def test_templates_json_columns_are_dicts() -> None:
+    """全量模板的 guardrails/deliverables 必须是 dict。
+
+    模板 D 曾把 guardrails 写成 set 笔误（{"每周 ≤2 本", "无卡不算完成"}），
+    流出后客户端回传即产生数组脏数据——这里防回归。
+    """
+    for t in list_templates():
+        if t["status"] != "available":
+            continue
+        assert isinstance(t["guardrails"], dict), f"模板 {t['id']} guardrails 不是 dict"
+        assert isinstance(t["deliverables"], dict), f"模板 {t['id']} deliverables 不是 dict"
