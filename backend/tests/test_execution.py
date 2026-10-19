@@ -543,7 +543,6 @@ class TestTasksServiceGatewayContract:
 
         async def heartbeat(session, task_id, *, lease_token, settings=None):
             calls["heartbeat"].append({"task_id": str(task_id), "lease_token": str(lease_token)})
-            task = state["task"]
             return types.SimpleNamespace(
                 id=task_id, leased_until=utcnow() + timedelta(seconds=90)
             )
