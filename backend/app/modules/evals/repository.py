@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.errors import NotFoundError
 
 from .models import EvalResult, EvalRun, EvalTask
+from .radar import RadarSample
 from .schemas import TaskOut
 
 
@@ -71,6 +72,9 @@ class EvalRepository(Protocol):
     async def list_results(self, run_id: str) -> list[EvalResult]: ...
 
     async def find_cached(self, key: str, *, since: datetime) -> EvalResult | None: ...
+
+    async def list_result_samples(self, *, start: datetime, end: datetime) -> list[RadarSample]:
+        """[start, end) 内的打分样本，带题目维度。雷达聚合的唯一数据来源。"""
 
 
 class SqlEvalRepository:
@@ -180,6 +184,40 @@ class SqlEvalRepository:
             .limit(1)
         )
         return (await self._s.execute(stmt)).scalar_one_or_none()
+
+    async def list_result_samples(
+        self, *, start: datetime, end: datetime
+    ) -> list[RadarSample]:
+        """一次查询取回整周样本（20 题 × 5 模型 = 100 行，单查询足够快）。
+
+        用 `join` 而不是"先查 task 再逐条查结果"：后者是 N+1，
+        在"响应 < 200ms"这条验收上必然翻车。
+        归档题目仍然 join 得到（软删只改 `archived_at`），历史分数不会凭空消失。
+        """
+        stmt = (
+            select(
+                EvalTask.dimension,
+                EvalResult.model,
+                EvalResult.score,
+                EvalResult.cost_usd,
+                EvalResult.latency_ms,
+                EvalResult.cached,
+            )
+            .join(EvalTask, EvalTask.id == EvalResult.task_id)
+            .where(EvalResult.created_at >= start, EvalResult.created_at < end)
+        )
+        rows = (await self._s.execute(stmt)).all()
+        return [
+            RadarSample(
+                dimension=str(row.dimension),
+                model=str(row.model),
+                score=float(row.score),
+                cost_usd=float(row.cost_usd),
+                latency_ms=int(row.latency_ms),
+                cached=bool(row.cached),
+            )
+            for row in rows
+        ]
 
 
 def to_task_out(task: EvalTask) -> TaskOut:

@@ -21,6 +21,7 @@ from app.modules.evals.repository import EvalRepository, SqlEvalRepository, to_t
 from app.modules.evals.runner import execute_run, provider_for
 from app.modules.evals.schemas import (
     Dimension,
+    RadarOut,
     RunCreate,
     RunDetail,
     RunOut,
@@ -188,3 +189,31 @@ async def create_run(
 @router.get("/runs/{run_id}", response_model=RunDetail, summary="运行详情与结果")
 async def get_run(run_id: str, _: ReadDep, repo: EvalsRepoDep) -> RunDetail:
     return await svc.get_run_detail(repo, run_id)
+
+
+# ---------------------------------------------------------------------------
+# 雷达聚合（W08-I02）
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/radar",
+    response_model=RadarOut,
+    summary="8 维雷达（缺样本的维度返回 insufficient）",
+)
+async def get_radar(
+    _: ReadDep,
+    repo: EvalsRepoDep,
+    week: Annotated[
+        str | None,
+        Query(
+            description="ISO 周（2026-W42）或该周内任意日期（2026-10-14）；留空为本周",
+            max_length=10,
+        ),
+    ] = None,
+    models: Annotated[
+        list[str] | None,
+        Query(description="只关心这几个模型；留空为当周出现过的全部模型"),
+    ] = None,
+) -> RadarOut:
+    return await svc.get_radar(repo, week=week, models=models)

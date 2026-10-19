@@ -11,10 +11,12 @@ from datetime import datetime
 from app.core.errors import ConflictError, ValidationError
 
 from .models import EvalRun, EvalTask
+from .radar import aggregate_radar, parse_week
 from .repository import EvalRepository, new_id, to_task_out
 from .runner import default_cost_cap_cny
 from .schemas import (
     DIMENSIONS,
+    RadarOut,
     ResultOut,
     RunCreate,
     RunDetail,
@@ -234,11 +236,27 @@ async def get_run_detail(repo: EvalRepository, run_id: str) -> RunDetail:
     )
 
 
+async def get_radar(
+    repo: EvalRepository,
+    *,
+    week: str | None = None,
+    models: list[str] | None = None,
+    now: datetime | None = None,
+) -> RadarOut:
+    """一周的 8 维雷达。聚合本身是纯函数（radar.aggregate_radar），这里只做取数。"""
+    stamp = now or datetime.utcnow()
+    window = parse_week(week, now=stamp)
+    samples = await repo.list_result_samples(start=window.start, end=window.end)
+    payload = aggregate_radar(samples, window=window, models=models)
+    return RadarOut.model_validate(payload)
+
+
 __all__ = [
     "REQUIRED_PER_DIMENSION",
     "REQUIRED_TOTAL",
     "create_run",
     "create_task",
+    "get_radar",
     "get_run_detail",
     "list_tasks",
     "load_run_tasks",

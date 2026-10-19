@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -141,9 +141,55 @@ class RunDetail(BaseModel):
     results: list[ResultOut] = Field(default_factory=list)
 
 
+# ---------------------------------------------------------------------------
+# 雷达（W08-I02）：字段名是 W10 画图的契约
+# ---------------------------------------------------------------------------
+
+RadarStatus = Literal["ok", "insufficient"]
+
+
+class ModelDimensionScore(BaseModel):
+    """某模型在某维度上的表现。`insufficient` 时 `score` 为 None 而不是 0。"""
+
+    status: RadarStatus
+    score: float | None = None
+    cost: float = 0.0
+    p50_latency: int | None = None
+    samples: int = 0
+
+
+class DimensionScore(BaseModel):
+    """一个维度的聚合结果。`models` 是同一维度的按模型拆分（雷达图每条轴要分层画）。"""
+
+    dimension: str
+    label: str
+    status: RadarStatus
+    score: float | None = None
+    cost: float = 0.0
+    p50_latency: int | None = None
+    samples: int = 0
+    models: dict[str, ModelDimensionScore] = Field(default_factory=dict)
+
+
+class RadarOut(BaseModel):
+    week: str
+    week_start: date
+    week_end: date
+    models: list[str] = Field(default_factory=list)
+    samples: int = 0
+    total_cost_usd: float = 0.0
+    dimensions: list[DimensionScore] = Field(default_factory=list)
+    #: 落在 8 轴之外的维度名（历史残留），显式暴露而不是静默丢弃
+    unknown_dimensions: list[str] = Field(default_factory=list)
+
+
 __all__ = [
     "DIMENSIONS",
     "Dimension",
+    "DimensionScore",
+    "ModelDimensionScore",
+    "RadarOut",
+    "RadarStatus",
     "RubricItem",
     "RunCreate",
     "RunDetail",
