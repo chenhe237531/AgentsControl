@@ -1,0 +1,18 @@
+<!--
+  AFC Agent 的 WinSW 包装配置（参考）。
+  实际安装使用 sc.exe 直接注册系统服务（sc.exe 是 Windows 自带，无需附带 winsw.exe）。
+  本文件作为"如果以后要切到 WinSW"的参考，不在当前安装路径使用。
+-->
+<service>
+  <id>dev.afc.agent</id>
+  <name>AFC Agent</name>
+  <description>AgentsControl device side agent</description>
+  <executable>%BASE%\afc-agent.exe</executable>
+  <arguments></arguments>
+  <env name="AFC_API_BASE_URL" value="http://127.0.0.1:8000/api/v1"/>
+  <env name="AFC_NODE_ID" value="n-pc"/>
+  <env name="AFC_TOKEN" value="REPLACE_ME"/>
+  <log mode="roll"/>
+  <onailure action="restart" delay="5 sec"/>
+  <startmode>auto</startmode>
+</service>
