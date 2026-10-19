@@ -62,9 +62,9 @@ func runInstall(args []string) int {
 			fmt.Fprintf(os.Stderr, "无法确定可执行路径：%v（用 --binary 显式指定）\n", err)
 			return 1
 		}
-		exe, err = filepath.EvalSymlinks(exe)
-		if err != nil {
-			exe = bin
+		// 解析符号链接拿到真实路径（brew bin 等）；失败时保留原路径继续
+		if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+			exe = resolved
 		}
 		bin = exe
 	}

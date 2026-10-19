@@ -3,6 +3,7 @@
 package main
 
 import (
+	"encoding/xml"
 	"fmt"
 	"os"
 	"os/exec"
@@ -24,13 +25,13 @@ func platformInstall(bin string, env map[string]string, extraArgs []string) erro
 	}
 	envStrings := make([]string, 0, len(env))
 	for k, v := range env {
-		envStrings = append(envStrings, fmt.Sprintf(`<string>%s=%s</string>`, k, v))
+		envStrings = append(envStrings, fmt.Sprintf("<string>%s=%s</string>", xmlEscape(k), xmlEscape(v)))
 	}
 	args := []string{bin}
 	args = append(args, extraArgs...)
 	argStrings := make([]string, 0, len(args))
 	for _, a := range args {
-		argStrings = append(argStrings, fmt.Sprintf(`<string>%s</string>`, a))
+		argStrings = append(argStrings, fmt.Sprintf("<string>%s</string>", xmlEscape(a)))
 	}
 	plist := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -53,8 +54,9 @@ func platformInstall(bin string, env map[string]string, extraArgs []string) erro
 </dict>
 </plist>
 `, label, strings.Join(argStrings, "\n        "), strings.Join(envStrings, "\n        "),
-		env["AFC_STATE_PATH"], env["AFC_STATE_PATH"])
-	if err := os.WriteFile(plistPath, []byte(plist), 0o644); err != nil {
+		xmlEscape(env["AFC_STATE_PATH"]), xmlEscape(env["AFC_STATE_PATH"]))
+	// plist 含 AFC_TOKEN 明文，权限收紧为仅属主可读写
+	if err := os.WriteFile(plistPath, []byte(plist), 0o600); err != nil {
 		return fmt.Errorf("写 plist: %w", err)
 	}
 	// 若已加载则先 unload，避免 "service already loaded"
@@ -89,4 +91,14 @@ func platformLogPath() string {
 
 func startHint() string {
 	return "launchctl list | grep " + ServiceUnit
+}
+
+// xmlEscape 转义 plist 值里的 XML 特殊字符（& < > 等），
+// 避免 token 或路径含特殊字符时写出的 plist 无法解析。
+func xmlEscape(s string) string {
+	var b strings.Builder
+	if err := xml.EscapeText(&b, []byte(s)); err != nil {
+		return s
+	}
+	return b.String()
 }

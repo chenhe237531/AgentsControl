@@ -91,11 +91,12 @@ func main() {
 	gate := newSnapshotGate()
 
 	var wg sync.WaitGroup
-	wg.Add(4)
+	wg.Add(3)
 	go func() { defer wg.Done(); heartbeatLoop(ctx, cfg, collector, client, wakeCh) }()
 	go func() { defer wg.Done(); flushLoop(ctx, cfg, buf, client, gate) }()
 	go func() { defer wg.Done(); snapshotLoop(ctx, cfg, collector, client, gate, wakeCh) }()
-	go func() { defer wg.Done(); listenWakes(wakeCh, func() {}) }()
+	// 注意：wakeCh 只能由 snapshotLoop 一个消费者接收；
+	// 再挂一个空回调消费者会随机抢走唤醒信号，导致唤醒后漏发快照。
 
 	<-ctx.Done()
 	slog.Info("shutdown signal received, draining")

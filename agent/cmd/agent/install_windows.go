@@ -30,10 +30,21 @@ func platformInstall(bin string, env map[string]string, extraArgs []string) erro
 		"actions=", "restart/5000/restart/5000/restart/60000").Run(); err != nil {
 		return fmt.Errorf("sc failure: %w", err)
 	}
-	// 环境变量写到系统服务（通过注册表会在 service 启动时生效，但 sc.exe 不直接支持；
-	// 这里推荐用 .env 文件 + agent 自行读取，避免改动系统注册表）
-	if envPath := env["AFC_ENV_FILE"]; envPath != "" {
-		fmt.Fprintf(os.Stderr, "warning: Windows 服务不直接读 KEY=VALUE 文件，请用 AFC_ENV_FILE=%s 让 agent 自行读取\n", envPath)
+	// sc.exe 不支持直接传环境变量；服务环境变量写入注册表
+	// HKLM\...\Services\<name>\Environment（REG_MULTI_SZ），服务控制管理器启动时会读取。
+	// 之前这里只打一行 warning 然后丢弃全部 env——装出来的服务会因缺 AFC_TOKEN 反复崩溃重启。
+	if len(env) > 0 {
+		values := make([]string, 0, len(env))
+		for k, v := range env {
+			values = append(values, k+"="+v)
+		}
+		// reg.exe 对 REG_MULTI_SZ 以字面 \0 分隔多个值
+		if out, err := exec.Command("reg.exe", "add",
+			`HKLM\SYSTEM\CurrentControlSet\Services\`+name+`\Environment`,
+			"/v", "Environment", "/t", "REG_MULTI_SZ", "/d",
+			strings.Join(values, `\0`), "/f").CombinedOutput(); err != nil {
+			return fmt.Errorf("reg add Environment: %w（%s）", err, strings.TrimSpace(string(out)))
+		}
 	}
 	return exec.Command("sc.exe", "start", name).Run()
 }

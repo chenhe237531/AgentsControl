@@ -32,7 +32,10 @@ jobs:
         uses: goreleaser/goreleaser-action@v6
         with:
           version: latest
-          args: release --clean -f agent/.goreleaser.yaml
+          # goreleaser 不会自动 cd 到配置所在目录（子目录配置是 Pro 的 monorepo 功能），
+          # 必须 workdir 到 agent/，否则 before hook 的 go mod tidy 在仓库根（无 go.mod）必失败
+          workdir: agent
+          args: release --clean -f .goreleaser.yaml
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -41,6 +44,6 @@ jobs:
         run: |
           echo "## Release 产物" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          ls -lh dist/ | tail -n +2 | awk '{printf "- %s\n", $0}' >> $GITHUB_STEP_SUMMARY
+          ls -lh agent/dist/ | tail -n +2 | awk '{printf "- %s\n", $0}' >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**macOS 未签名**：用户首次运行需手动允许" >> $GITHUB_STEP_SUMMARY

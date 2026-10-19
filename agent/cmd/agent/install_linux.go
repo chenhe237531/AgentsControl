@@ -24,6 +24,10 @@ func platformInstall(bin string, env map[string]string, extraArgs []string) erro
 	}
 	envLines := make([]string, 0, len(env))
 	for k, v := range env {
+		// 值含空白时按 systemd 规范加引号，否则 Environment= 会在空格处截断
+		if strings.ContainsAny(v, " \t") {
+			v = `"` + v + `"`
+		}
 		envLines = append(envLines, fmt.Sprintf("Environment=%s=%s", k, v))
 	}
 	args := append([]string{bin}, extraArgs...)
@@ -44,7 +48,8 @@ StandardError=append:%s/log/afc-agent.err.log
 WantedBy=default.target
 `, execStart, strings.Join(envLines, "\n"),
 		env["AFC_STATE_PATH"], env["AFC_STATE_PATH"])
-	if err := os.WriteFile(unitPath, []byte(content), 0o644); err != nil {
+	// unit 含 AFC_TOKEN 明文，权限收紧为仅属主可读写
+	if err := os.WriteFile(unitPath, []byte(content), 0o600); err != nil {
 		return fmt.Errorf("写 unit: %w", err)
 	}
 	if err := exec.Command("systemctl", "--user", "daemon-reload").Run(); err != nil {

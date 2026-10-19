@@ -11,11 +11,18 @@
 //	offline —— 连续失败超 offlineThreshold（默认 30s）；恢复成功立刻切回 online
 package transport
 
-import "time"
+import (
+	"sync"
+	"time"
+)
 
 type onlineState struct {
 	offlineThreshold time.Duration
 	maxBackoff       time.Duration
+
+	// heartbeat/flush/snapshot 三个循环共用同一个 Client 并发调用，
+	// 全部状态必须在锁内读写，否则 -race 报数据竞争。
+	mu sync.Mutex
 
 	lastSuccess time.Time
 	lastFailure time.Time
@@ -35,6 +42,8 @@ func newOnlineState() *onlineState {
 // nextBackoff 返回下次重试应等待的时长。
 // 指数退避：500ms → 1s → 2s → 4s → 8s → 16s → 32s → 1m → 2m → 4m → 5m（封顶）。
 func (s *onlineState) nextBackoff() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.currentBackoff == 0 {
 		s.currentBackoff = 500 * time.Millisecond
 	} else {
@@ -48,6 +57,8 @@ func (s *onlineState) nextBackoff() time.Duration {
 
 // markSuccess 记录成功并切回 online。
 func (s *onlineState) markSuccess() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.lastSuccess = time.Now()
 	s.currentBackoff = 0
 	if s.isOffline {
@@ -58,6 +69,8 @@ func (s *onlineState) markSuccess() {
 // markFailure 记录失败，超过阈值则进入 offline。
 // 返回 (justWentOffline bool) 让调用方决定是否打日志。
 func (s *onlineState) markFailure() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.lastFailure = time.Now()
 	if !s.isOffline && time.Since(s.lastSuccess) > s.offlineThreshold {
 		s.isOffline = true
@@ -66,4 +79,8 @@ func (s *onlineState) markFailure() bool {
 	return false
 }
 
-func (s *onlineState) IsOffline() bool { return s.isOffline }
+func (s *onlineState) IsOffline() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.isOffline
+}

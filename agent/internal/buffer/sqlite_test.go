@@ -46,9 +46,60 @@ func TestSQLiteAppendAndPeek(t *testing.T) {
 		t.Fatalf("Peek 事件顺序错误: %+v", batch.Events)
 	}
 
-	// 未 Ack 前 Peek 返回 ErrEmpty（全部已 sent 状态）
+	// Peek 只读：未 Ack 前再次 Peek 必须取到同一批事件（Post 失败原样重发的根基）
+	again, err := s.Peek(10)
+	if err != nil {
+		t.Fatalf("second Peek: %v", err)
+	}
+	if again.FromSeq != 1 || again.ToSeq != 2 || len(again.Events) != 2 {
+		t.Fatalf("未 Ack 前 second Peek 应返回同一批，实得 %+v", again)
+	}
+
+	// Ack 后才为空
+	if err := s.Ack(again.ToSeq); err != nil {
+		t.Fatalf("Ack: %v", err)
+	}
 	if _, err := s.Peek(10); err != ErrEmpty {
-		t.Fatalf("未 Ack 前 second Peek 应为 ErrEmpty，实得 %v", err)
+		t.Fatalf("Ack 后 Peek 应为 ErrEmpty，实得 %v", err)
+	}
+}
+
+// TestSQLiteResendAfterFailedPost 回归测试（PR #7 评审阻塞项 #1）：
+// Peek 不再有 sent 副作用。Post 失败（不 Ack）后追加新事件，
+// 下一轮 Peek 必须仍从最早未 Ack 的事件开始——既不丢旧事件，也不被后续 Ack 连带删除。
+func TestSQLiteResendAfterFailedPost(t *testing.T) {
+	s := newTestSQLite(t, 0, 0)
+	defer s.Close()
+
+	if _, _, err := s.Append(protocol.Event{Kind: "x", Task: "t1"}); err != nil {
+		t.Fatal(err)
+	}
+	first, err := s.Peek(500)
+	if err != nil {
+		t.Fatalf("first Peek: %v", err)
+	}
+	// 模拟 Post 失败：什么都不做（不 Ack）
+
+	if _, _, err := s.Append(protocol.Event{Kind: "y", Task: "t2"}); err != nil {
+		t.Fatal(err)
+	}
+	second, err := s.Peek(500)
+	if err != nil {
+		t.Fatalf("second Peek: %v", err)
+	}
+	if second.FromSeq != first.FromSeq || len(second.Events) != 2 {
+		t.Fatalf("Post 失败后重发批次丢失旧事件: first=%+v second=%+v", first, second)
+	}
+	if second.Dropped != 0 {
+		t.Fatalf("无超限不应有 dropped，实得 %d", second.Dropped)
+	}
+
+	// 全部发送成功后 Ack：两行都应被删除，不留滞留行
+	if err := s.Ack(second.ToSeq); err != nil {
+		t.Fatalf("Ack: %v", err)
+	}
+	if _, err := s.Peek(500); err != ErrEmpty {
+		t.Fatalf("Ack 后 Peek 应 ErrEmpty，实得 %v", err)
 	}
 }
 
@@ -157,7 +208,7 @@ func TestSQLiteDropsOldestOnBytesOverflow(t *testing.T) {
 }
 
 func TestSQLitePurgesAgeOnAck(t *testing.T) {
-	// maxAge 极短：写入后立即 Peek 占住 sent，Ack 时按年龄清掉
+	// maxAge 极短：超龄行在下次 enforceLimits（Append 触发）时被清掉并计入 dropped
 	s := newTestSQLite(t, 0, 1*time.Millisecond)
 	defer s.Close()
 

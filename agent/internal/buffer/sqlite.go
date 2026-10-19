@@ -26,7 +26,7 @@ import (
 //  3. Peek 看未 Ack 的最早一批；Ack 成功才推进游标
 //
 // 超限判定按"字节数"和"年龄"双重：超过 BufferMaxBytes 删最旧；
-// 超过 BufferMaxAge 的已 Ack 行也清掉（保留未 Ack 行以免丢未发数据）。
+// 超过 BufferMaxAge 的超龄行也清掉。两类丢弃都必须累加 dropped 随批次上报。
 type SQLite struct {
 	mu       sync.Mutex
 	db       *sql.DB
@@ -73,15 +73,16 @@ func NewSQLite(path string, maxBytes int64, maxAge time.Duration) (*SQLite, erro
 func (s *SQLite) init(ctx context.Context) error {
 	// events 存未 Ack 的事件（待发）；seq 单调递增且有索引便于按序读
 	// meta 存 next_seq / dropped_count，跨重启不丢
+	// state 列仅作旧库兼容保留：Peek 不再标记 sent（Post 失败后原样重发），
+	// 未 Ack 的行一律视为待发。
 	schema := `
 CREATE TABLE IF NOT EXISTS events (
     seq    INTEGER PRIMARY KEY,
     kind   TEXT NOT NULL,
     body   BLOB NOT NULL,
     occur  INTEGER NOT NULL,
-    state TEXT NOT NULL DEFAULT 'pending'  -- pending / sent
+    state TEXT NOT NULL DEFAULT 'pending'
 );
-CREATE INDEX IF NOT EXISTS idx_events_state_seq ON events(state, seq);
 
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -105,11 +106,8 @@ CREATE TABLE IF NOT EXISTS meta (
 	}
 	s.nextSeq = nextSeq
 
-	// 启动时把上次"已发但未 Ack"的残留事件回滚为 pending
-	// （kill -9 在 Post 与 Ack 之间发生时，sent 行应被重发，幂等由服务端 (node,seq) 保证）
-	if _, err := s.db.ExecContext(ctx, "UPDATE events SET state='pending' WHERE state='sent'"); err != nil {
-		return fmt.Errorf("reset sent->pending: %w", err)
-	}
+	// 旧版本二进制可能留下 state='sent' 的残留行：Peek/Ack 已不按状态过滤，
+	// 这些行会被原样重发（幂等由服务端 (node,seq) 保证），无需回滚。
 
 	// dropped_count 持久累计（用于断电前后一致性）；运行期 Ack 清零
 	var dropped uint64
@@ -191,7 +189,7 @@ func (s *SQLite) Peek(max int) (protocol.EventBatch, error) {
 		limit = 500
 	}
 	rows, err := s.db.QueryContext(ctx,
-		"SELECT seq, kind, body, occur FROM events WHERE state='pending' ORDER BY seq ASC LIMIT ?",
+		"SELECT seq, kind, body, occur FROM events ORDER BY seq ASC LIMIT ?",
 		limit)
 	if err != nil {
 		return protocol.EventBatch{}, fmt.Errorf("peek: %w", err)
@@ -229,13 +227,8 @@ func (s *SQLite) Peek(max int) (protocol.EventBatch, error) {
 	if len(batch.Events) == 0 {
 		return protocol.EventBatch{}, ErrEmpty
 	}
-
-	// 标记为 sent（kill -9 后重启会发现 sent 行回滚为 pending 重发）
-	if _, err := s.db.ExecContext(ctx,
-		"UPDATE events SET state='sent' WHERE seq BETWEEN ? AND ?",
-		batch.FromSeq, batch.ToSeq); err != nil {
-		return protocol.EventBatch{}, fmt.Errorf("mark sent: %w", err)
-	}
+	// Peek 只读不写：Post 失败后不 Ack，下一轮 Peek 取到同一批事件原样重发；
+	// kill -9 后重启同理（幂等由服务端 (node,seq) 去重保证）。
 	return batch, nil
 }
 
@@ -253,7 +246,7 @@ func (s *SQLite) Ack(toSeq uint64) error {
 	defer func() { _ = tx.Rollback() }()
 
 	if _, err := tx.ExecContext(ctx,
-		"DELETE FROM events WHERE seq<=? AND state='sent'", toSeq); err != nil {
+		"DELETE FROM events WHERE seq<=?", toSeq); err != nil {
 		return fmt.Errorf("delete acked: %w", err)
 	}
 	// 累计 dropped 已随本批上报，清零并持久化
@@ -304,27 +297,34 @@ func (s *SQLite) diskPressure() bool {
 	return ratio > 0.90
 }
 
-// enforceLimits 超限丢最旧并累加 dropped。
+// enforceLimits 超限丢弃并累加 dropped。
 // 调用方已持锁。两个触发条件：
-//  1. 字节数超 maxBytes：删最早的 pending 行直到恢复到阈值以下
-//  2. 年龄超 maxAge：删所有超龄的 sent 行（pending 行若也超龄，因未发出不删）
+//  1. 年龄超 maxAge：删所有超龄行（超龄即意味着长时间未送达，属于超限丢弃）
+//  2. 字节数超 maxBytes：删最早的行（"丢最旧"）直到恢复到阈值以下
 //
-// 注意：删 pending 行才算"丢"，必须累加 dropped_count 并持久化。
+// 注意：凡是这里删掉的行都是"丢"，必须累加 dropped_count 并持久化，
+// 随下一批上报（默认 maxAge=7 天，远大于断网重连窗口，不会误伤短期离线数据）。
 func (s *SQLite) enforceLimits(ctx context.Context) error {
 	if s.maxBytes <= 0 && s.maxAge <= 0 {
 		return nil
 	}
 
-	// 1. 年龄清理（只删 sent 行）
+	droppedNow := false
+
+	// 1. 年龄清理
 	if s.maxAge > 0 {
 		cutoff := time.Now().Add(-s.maxAge).Unix()
-		if _, err := s.db.ExecContext(ctx,
-			"DELETE FROM events WHERE occur<? AND state='sent'", cutoff); err != nil {
+		res, err := s.db.ExecContext(ctx, "DELETE FROM events WHERE occur<?", cutoff)
+		if err != nil {
 			return fmt.Errorf("age purge: %w", err)
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			s.dropped += uint64(n)
+			droppedNow = true
 		}
 	}
 
-	// 2. 字节清理：删最早的 pending 行（即"丢最旧"），累加 dropped
+	// 2. 字节清理：删最早的一行（丢最旧）
 	if s.maxBytes > 0 {
 		for {
 			var size int64
@@ -335,26 +335,26 @@ func (s *SQLite) enforceLimits(ctx context.Context) error {
 			if size <= s.maxBytes {
 				break
 			}
-			// 删最早的一行 pending（不论它有多老，丢最旧就是丢最早的未发事件）
 			res, err := s.db.ExecContext(ctx,
-				"DELETE FROM events WHERE seq=(SELECT MIN(seq) FROM events WHERE state='pending')")
+				"DELETE FROM events WHERE seq=(SELECT MIN(seq) FROM events)")
 			if err != nil {
 				return fmt.Errorf("drop oldest: %w", err)
 			}
 			n, _ := res.RowsAffected()
 			if n == 0 {
-				break // 没有 pending 行可删了（只剩 sent 行待 Ack）
+				break // 表已空
 			}
 			s.dropped++
+			droppedNow = true
 		}
+	}
 
-		if s.dropped > 0 {
-			if _, err := s.db.ExecContext(ctx,
-				"INSERT INTO meta(key,value) VALUES('dropped_count',?) "+
-					"ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-				s.dropped); err != nil {
-				return fmt.Errorf("persist dropped: %w", err)
-			}
+	if droppedNow {
+		if _, err := s.db.ExecContext(ctx,
+			"INSERT INTO meta(key,value) VALUES('dropped_count',?) "+
+				"ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+			s.dropped); err != nil {
+			return fmt.Errorf("persist dropped: %w", err)
 		}
 	}
 	return nil

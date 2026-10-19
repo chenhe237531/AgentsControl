@@ -11,8 +11,6 @@ package main
 import (
 	"sync"
 	"time"
-
-	"log/slog"
 )
 
 // snapshotGate 是一个一次性的"快照已就绪"信号。
@@ -92,13 +90,4 @@ func (w *wakeDetector) observe(now time.Time) bool {
 // 但 2.5x 一般只可能由系统睡眠造成（heartbeat 60s → 阈值 150s）。
 func newWakeDetector(heartbeat time.Duration) *wakeDetector {
 	return &wakeDetector{threshold: heartbeat * 5 / 2}
-}
-
-// listenWakes 把 wakeChan 上的唤醒信号转发到 snapshotLoop。
-// snapshotLoop 还监听 ticker；把 wakeCh 也作为 snapshot 的触发源。
-func listenWakes(wakeCh <-chan struct{}, onWake func()) {
-	for range wakeCh {
-		slog.Info("wake detected, snapshot first")
-		onWake()
-	}
 }

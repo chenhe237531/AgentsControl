@@ -5,7 +5,8 @@
 #   - 三平台 amd64/arm64 产物 + checksums.txt
 #   - 版本号 ldflags 注入，afc-agent -version 输出正确
 #   - macOS 未签名：release notes 必须说明（不再静默）
-#   - W05 allow 不含根目录，所以 config 放 agent/ 下；workflow 通过 -f 指定
+#   - W05 allow 不含根目录，所以 config 放 agent/ 下；workflow 用 workdir=agent
+#   - agent/ 下没有 README.md / LICENSE，archives 不附加文件（避免 goreleaser 找不到文件报错）
 project_name: afc-agent
 
 before:
@@ -48,9 +49,6 @@ archives:
     format_overrides:
       - goos: windows
         formats: [ 'zip' ]
-    files:
-      - README.md
-      - LICENSE*
 
 checksum:
   name_template: 'checksums.txt'
