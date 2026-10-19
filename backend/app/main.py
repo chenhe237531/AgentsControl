@@ -18,13 +18,30 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.health import health_router
 from app.api.router import api_router
 from app.core.config import settings
-from app.core.db import dispose_engine
+from app.core.db import dispose_engine, get_sessionmaker
 from app.core.errors import register_exception_handlers
 from app.core.logging import setup_logging
 from app.core.middleware import RequestContextMiddleware, SecurityHeadersMiddleware
 from app.core.redis import close_redis
 
 logger = logging.getLogger("afc.app")
+
+
+async def _sweep_stale_execution_sessions() -> None:
+    """执行面启动清扫：上一进程遗留的 running 会话标记 failed（keeper 已随进程丢失）。
+
+    清扫失败不阻塞启动——会话最多晚一个周期被修正，比起不来强。
+    """
+    from app.modules.execution import repository as exec_repo  # noqa: PLC0415
+    from app.modules.execution import service as exec_svc  # noqa: PLC0415
+
+    try:
+        async with get_sessionmaker()() as db:
+            await exec_svc.fail_stale_running_sessions(
+                exec_repo.SqlSessionStore(db), exec_repo.SqlEventStore(db)
+            )
+    except Exception:  # noqa: BLE001 - 启动路径兜底，任何失败只记日志
+        logger.exception("execution 会话启动清扫失败（不影响启动）")
 
 
 @asynccontextmanager
@@ -39,6 +56,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         },
     )
     # 配置在 import 期已完成校验（fail fast）；此处只做资源预热，不阻塞启动。
+    await _sweep_stale_execution_sessions()
     yield
     logger.info("api shutting down")
     await dispose_engine()

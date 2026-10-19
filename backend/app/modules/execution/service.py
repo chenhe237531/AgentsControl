@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import secrets
 from datetime import UTC, datetime
 from pathlib import Path
@@ -94,6 +95,8 @@ class OrcaCommandFailedError(UpstreamError):
 
 LEASE_RENEW_SECONDS = 60.0
 
+logger = logging.getLogger("afc.app")
+
 _lease_keepers: dict[str, asyncio.Task[None]] = {}
 
 
@@ -113,7 +116,51 @@ def _start_lease_keeper(session_id: str, task_id: str, tasks: TasksGateway) -> N
 async def _lease_keep_loop(session_id: str, task_id: str, tasks: TasksGateway) -> None:
     while True:
         await asyncio.sleep(LEASE_RENEW_SECONDS)
-        await tasks.renew_lease(task_id, worker=session_id)
+        try:
+            await tasks.renew_lease(task_id, worker=session_id)
+        except asyncio.CancelledError:
+            raise  # 正常停止路径（kill/回收/崩溃）
+        except ConflictError as exc:
+            # 租约已被回收/转手（lease_lost）：续约无意义，停止 keeper。
+            # 任务侧由回收路径重投/死信，会话状态由下次交互或启动清扫修正。
+            logger.warning(
+                "lease keeper 停止（租约丢失）: session=%s task=%s err=%s",
+                session_id, task_id, exc,
+            )
+            _lease_keepers.pop(session_id, None)
+            return
+        except Exception:
+            # 瞬时故障（tasks 模块不可用/DB 抖动）：记日志，下一轮继续重试。
+            # 此前没有这层保护，keeper 协程会静默死亡，会话永远停在 running。
+            logger.exception(
+                "lease keeper 续约失败（下轮重试）: session=%s task=%s", session_id, task_id
+            )
+
+
+async def fail_stale_running_sessions(sessions: SessionStore, events: EventStore) -> int:
+    """启动清扫：把上一进程遗留的 running 会话标记为 failed。
+
+    lease keeper 是进程内 asyncio.Task，服务重启即丢失；不清扫的话这些会话
+    会永远停在 running，而任务侧早已被 W03 回收（重投/死信），两边状态脱节。
+    此处不动 tasks（过期租约归回收器所有，release 也只会被 lease_lost 拒绝）。
+    """
+    rows = await sessions.list_sessions(state="running", limit=1000)
+    for row in rows:
+        stop_lease_keeper(row.id)  # 防御：启动时通常为空
+        await sessions.update(
+            row.id, state="failed", error="控制面重启，租约 keeper 丢失", ended_at=_now()
+        )
+        await events.append(
+            task_id=row.task_id,
+            kind="session.failed",
+            session_id=row.id,
+            payload={"reason": "service_restart", "retryable": True},
+        )
+    if rows:
+        await sessions.commit()
+        await events.commit()
+        logger.warning("启动清扫：%d 个遗留 running 会话已标记 failed", len(rows))
+    return len(rows)
 
 
 class WorkerService:
