@@ -56,6 +56,12 @@ async def module_status() -> dict[str, str]:
     return {"module": MODULE, "owner_window": OWNER_WINDOW, "state": "implemented"}
 
 
+@router.get("/_ping", summary="需要认证的占位端点（验证认证链路）")
+async def module_ping(_: OwnerDep) -> dict[str, str]:
+    """保留给契约快照：删掉已上线端点会被 CI 判为 breaking change（scripts/openapi_snapshot.py）。"""
+    return {"module": MODULE, "pong": "1"}
+
+
 # ---------------------------------------------------------------------------
 # 题库 CRUD
 # ---------------------------------------------------------------------------
