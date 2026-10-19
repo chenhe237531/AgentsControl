@@ -17,7 +17,7 @@ from fastapi import APIRouter, Depends, Query, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_db
-from app.core.deps import OwnerDep
+from app.core.deps import OwnerDep, Principal, require_scope
 from app.core.errors import NotImplementedYetError
 
 from . import service
@@ -46,6 +46,7 @@ OWNER_WINDOW = "W03"
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 DbDep = Annotated[AsyncSession, Depends(get_db)]
+WriteDep = Annotated[Principal, Depends(require_scope("tasks:write"))]
 
 
 @router.get("/_status", summary="模块状态（骨架自检用，保留以兼容冒烟测试）")
@@ -68,7 +69,7 @@ async def module_ping(_: OwnerDep) -> dict[str, str]:
     status_code=status.HTTP_201_CREATED,
     summary="创建任务（超预算直接进 held）",
 )
-async def create_task(payload: TaskCreate, session: DbDep, _: OwnerDep) -> TaskOut:
+async def create_task(payload: TaskCreate, session: DbDep, _: WriteDep) -> TaskOut:
     task = await service.create_task(session, payload)
     return service.to_out(task)
 
@@ -142,7 +143,7 @@ async def budget_status(session: DbDep, _: OwnerDep) -> BudgetStatusOut:
     responses={204: {"description": "当前没有可执行任务"}},
     summary="领取下一个可执行任务（FOR UPDATE SKIP LOCKED）",
 )
-async def claim(body: ClaimIn, session: DbDep, _: OwnerDep) -> Any:
+async def claim(body: ClaimIn, session: DbDep, _: WriteDep) -> Any:
     result = await service.claim(session, body)
     if result is None:
         return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -170,7 +171,7 @@ async def candidates(task_id: uuid.UUID, session: DbDep, _: OwnerDep) -> Candida
 
 
 @router.post("/{task_id}/lease", response_model=LeaseOut, summary="指定任务领租（能力/预算校验）")
-async def lease(task_id: uuid.UUID, body: LeaseIn, session: DbDep, _: OwnerDep) -> LeaseOut:
+async def lease(task_id: uuid.UUID, body: LeaseIn, session: DbDep, _: WriteDep) -> LeaseOut:
     task, lease_seconds = await service.lease(session, task_id, body)
     return LeaseOut(
         task=service.to_out(task),
@@ -183,7 +184,7 @@ async def lease(task_id: uuid.UUID, body: LeaseIn, session: DbDep, _: OwnerDep) 
 
 @router.post("/{task_id}/heartbeat", response_model=HeartbeatOut, summary="续租（30s 一次）")
 async def heartbeat(
-    task_id: uuid.UUID, body: HeartbeatIn, session: DbDep, _: OwnerDep
+    task_id: uuid.UUID, body: HeartbeatIn, session: DbDep, _: WriteDep
 ) -> HeartbeatOut:
     task = await service.heartbeat(session, task_id, lease_token=body.lease_token)
     return HeartbeatOut(
@@ -195,14 +196,14 @@ async def heartbeat(
 
 @router.post("/{task_id}/start", response_model=TaskOut, summary="开始执行（leased → running）")
 async def start(
-    task_id: uuid.UUID, body: HeartbeatIn, session: DbDep, _: OwnerDep
+    task_id: uuid.UUID, body: HeartbeatIn, session: DbDep, _: WriteDep
 ) -> TaskOut:
     return service.to_out(await service.start(session, task_id, lease_token=body.lease_token))
 
 
 @router.post("/{task_id}/complete", response_model=TaskOut, summary="交货（→ done）")
 async def complete(
-    task_id: uuid.UUID, body: CompleteIn, session: DbDep, _: OwnerDep
+    task_id: uuid.UUID, body: CompleteIn, session: DbDep, _: WriteDep
 ) -> TaskOut:
     task = await service.complete(
         session, task_id, lease_token=body.lease_token, result=body.result
@@ -211,7 +212,7 @@ async def complete(
 
 
 @router.post("/{task_id}/fail", response_model=TaskOut, summary="失败上报（可重投则退避，否则进死信）")
-async def fail(task_id: uuid.UUID, body: FailIn, session: DbDep, _: OwnerDep) -> TaskOut:
+async def fail(task_id: uuid.UUID, body: FailIn, session: DbDep, _: WriteDep) -> TaskOut:
     task = await service.fail(
         session,
         task_id,
@@ -223,7 +224,7 @@ async def fail(task_id: uuid.UUID, body: FailIn, session: DbDep, _: OwnerDep) ->
 
 
 @router.post("/{task_id}/cancel", response_model=TaskOut, summary="取消任务")
-async def cancel(task_id: uuid.UUID, body: CancelIn, session: DbDep, _: OwnerDep) -> TaskOut:
+async def cancel(task_id: uuid.UUID, body: CancelIn, session: DbDep, _: WriteDep) -> TaskOut:
     return service.to_out(await service.cancel(session, task_id, reason=body.reason))
 
 
@@ -232,5 +233,5 @@ async def cancel(task_id: uuid.UUID, body: CancelIn, session: DbDep, _: OwnerDep
     response_model=TaskOut,
     summary="人工复活死信/失败任务（唯一复活入口）",
 )
-async def requeue(task_id: uuid.UUID, body: RequeueIn, session: DbDep, _: OwnerDep) -> TaskOut:
+async def requeue(task_id: uuid.UUID, body: RequeueIn, session: DbDep, _: WriteDep) -> TaskOut:
     return service.to_out(await service.requeue(session, task_id, body))

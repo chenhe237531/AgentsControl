@@ -1,7 +1,7 @@
 """w03_01: 任务队列与租约（tasks + task_device_stats）
 
 Revision ID: w03_01_tasks
-Revises: 0001_baseline
+Revises: w01_03_merge_heads
 Create Date: 2026-10-18
 
 窗口: W03
@@ -16,6 +16,9 @@ Create Date: 2026-10-18
 4. `cost_spent` / `budget_cap` 预留在任务行上，是为了派活时**不扫账本**（W07 提供明细）。
 
 降级会 drop 两张表，因此只允许在确认无数据依赖时执行。
+
+挂载点：W01/W02 的迁移链已在 `w01_03_merge_heads` 合流，本迁移接在其后，
+保证 `upgrade head` 只有一个 head（不再出现多 head 需要额外 merge 节点）。
 """
 
 from __future__ import annotations
@@ -27,7 +30,7 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision: str = "w03_01_tasks"
-down_revision: str | None = "0001_baseline"
+down_revision: str | None = "w01_03_merge_heads"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

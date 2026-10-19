@@ -102,7 +102,7 @@ TEMPLATE = '''"""{cn}模块 —— owner: {window}
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter
 
 from app.core.deps import OwnerDep
 from app.core.errors import NotImplementedYetError
