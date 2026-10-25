@@ -25,7 +25,19 @@ async function textContrast(page: Page): Promise<number> {
   });
 }
 
-const PAGES = ["/today", "/inbox", "/goals", "/execution", "/arsenal", "/assets", "/ledger"];
+const PAGES = [
+  "/today",
+  "/inbox",
+  "/goals",
+  "/execution",
+  "/team",
+  "/arsenal",
+  "/assets",
+  "/ledger",
+  "/overview",
+  "/projects",
+  "/absence",
+];
 
 for (const path of PAGES) {
   test(`可访问性与控制台：${path}`, async ({ page }) => {

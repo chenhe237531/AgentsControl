@@ -7,8 +7,41 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import { useEffect, useState } from "react";
 
 import { NAV_GROUPS, navByGroup } from "@/config/nav";
+
+function ThemeToggle() {
+  const [dark, setDark] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    setDark(document.documentElement.classList.contains("dark"));
+  }, []);
+
+  const toggle = (): void => {
+    const next = !(dark ?? document.documentElement.classList.contains("dark"));
+    document.documentElement.classList.toggle("dark", next);
+    try {
+      localStorage.setItem("af-theme", next ? "dark" : "light");
+    } catch {
+      // localStorage 不可用时只切本次会话
+    }
+    setDark(next);
+  };
+
+  return (
+    <button
+      type="button"
+      onClick={toggle}
+      aria-label={dark ? "切换到浅色主题" : "切换到暗色主题"}
+      title={dark ? "切到浅色" : "切到暗色"}
+      className="flex h-7 w-7 items-center justify-center rounded-md border border-line bg-surface text-[12px] text-muted hover:text-ink"
+    >
+      {/* 挂载前不渲染字形，避免 SSR/客户端不一致 */}
+      <span aria-hidden>{dark === null ? "" : dark ? "☾" : "☀"}</span>
+    </button>
+  );
+}
 
 export function Sidebar() {
   const pathname = usePathname();
@@ -60,8 +93,11 @@ export function Sidebar() {
         ))}
       </nav>
 
-      <div className="hidden px-2 pt-4 text-[10px] text-muted lg:block">
-        v{process.env.NEXT_PUBLIC_APP_VERSION ?? "0.1.0"}
+      <div className="flex items-center justify-between px-2 pt-4 lg:px-2">
+        <span className="hidden text-[10px] text-muted lg:block">
+          v{process.env.NEXT_PUBLIC_APP_VERSION ?? "0.1.0"}
+        </span>
+        <ThemeToggle />
       </div>
     </aside>
   );

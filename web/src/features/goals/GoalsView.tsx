@@ -7,8 +7,10 @@
  * 止损不是红字，是行动按钮（冻结 / 降级）——只显示状态等于把决策又推回给人。
  */
 
+import { useState } from "react";
+
 import { AsyncBoundary } from "@/components/AsyncBoundary";
-import { Badge, Button, Card, CardHeader, EmptyState, ProgressBar, StatTile } from "@/components/ui";
+import { Badge, Button, Card, CardHeader, ConfirmDialog, EmptyState, ProgressBar, StatTile, useToast } from "@/components/ui";
 import { useBudgetStatus, useGoals, usePatchGoal } from "@/lib/api/hooks";
 import type { Goal, GoalTrack } from "@/lib/api/types";
 import { daysLeft, hours, shortDate, yuan } from "@/lib/format";
@@ -27,7 +29,7 @@ export function GoalsView() {
 
   return (
     <div className="mx-auto max-w-6xl">
-      <header className="mb-4 flex items-end justify-between">
+      <header className="mb-4 flex flex-wrap items-end justify-between gap-2">
         <div>
           <h1 className="text-xl font-semibold tracking-tight">目标</h1>
           <p className="mt-1 text-[12px] text-muted">两条轨的验收方式不同，不要用同一套 KPI 压进化目标。</p>
@@ -78,6 +80,8 @@ export function GoalsView() {
 function GoalCard({ goal }: { goal: Goal }) {
   const budget = useBudgetStatus(goal.id);
   const patch = usePatchGoal();
+  const toast = useToast();
+  const [confirming, setConfirming] = useState(false);
   const days = daysLeft(goal.horizon_at);
   const stop = Boolean(goal.stop_loss_triggered_at) || goal.status === "frozen";
   const cap = goal.track === "money" ? goal.budget_money : goal.budget_hours;
@@ -141,21 +145,39 @@ function GoalCard({ goal }: { goal: Goal }) {
           <div className="flex gap-1.5">
             <Button
               variant="ghost"
-              onClick={() => patch.mutate({ id: goal.id, status: "frozen" })}
+              onClick={() =>
+                patch.mutate(
+                  { id: goal.id, status: "frozen" },
+                  { onSuccess: () => toast.push({ title: `已冻结「${goal.title.slice(0, 16)}」` }) },
+                )
+              }
               disabled={patch.isPending || goal.status === "frozen"}
             >
               冻结
             </Button>
-            <Button
-              variant="danger"
-              onClick={() => patch.mutate({ id: goal.id, status: "degraded" })}
-              disabled={patch.isPending}
-            >
+            <Button variant="danger" onClick={() => setConfirming(true)} disabled={patch.isPending}>
               降级为兴趣
             </Button>
           </div>
         </div>
       ) : null}
+
+      {/* 降级不可逆（目标转入兴趣池，不再占带宽），必须二次确认 */}
+      <ConfirmDialog
+        open={confirming}
+        title="降级为兴趣？"
+        body={`「${goal.title}」将转入兴趣池，不再进入执行队列。按设计这不算失败——进化轨 T+7 无产出物本就应降级。`}
+        confirmLabel="确认降级"
+        tone="danger"
+        busy={patch.isPending}
+        onCancel={() => setConfirming(false)}
+        onConfirm={() => {
+          patch.mutate(
+            { id: goal.id, status: "degraded" },
+            { onSuccess: () => { setConfirming(false); toast.push({ title: "已降级为兴趣", detail: goal.title }); } },
+          );
+        }}
+      />
     </article>
   );
 }

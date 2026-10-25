@@ -1,4 +1,4 @@
-.PHONY: help setup dev-api dev-web test lint migrate agent-build down
+.PHONY: help setup dev-api dev-web test lint migrate agent-build down up-local down-local
 
 help:
 	@echo "make setup     安装后端与前端依赖"
@@ -8,6 +8,8 @@ help:
 	@echo "make lint      ruff + gofmt"
 	@echo "make migrate   升级数据库到最新"
 	@echo "make down      停掉本地 compose 依赖"
+	@echo "make up-local  用 Docker 在本地整栈启动（:8080）"
+	@echo "make down-local 停掉本地整栈"
 
 setup: 
 	cd backend && python3 -m venv .venv && . .venv/bin/activate && pip install -e ".[dev]"
@@ -39,3 +41,10 @@ up-deps:
 
 down:
 	docker compose -f deploy/docker-compose.dev.yml down
+
+# 本地整栈（API + Web + PG + Redis + Caddy），入口 http://localhost:8080
+up-local:
+	docker compose -f deploy/docker-compose.local.yml up -d --build
+
+down-local:
+	docker compose -f deploy/docker-compose.local.yml down

@@ -48,3 +48,8 @@ coverage/
 .DS_Store
 .idea/
 .vscode/
+
+# --- 测试与本地工具产物 ---
+test-results/
+playwright-report/
+.trae-html-share-packages/

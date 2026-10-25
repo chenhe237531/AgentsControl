@@ -110,6 +110,11 @@ export function OverviewView() {
                 );
               })}
             </div>
+            {rows.length > 8 ? (
+              <div className="border-t border-line px-4 py-2.5 text-[12px] text-muted">
+                还有 {rows.length - 8} 个，<Link className="text-brand" href="/goals">去目标页看全部</Link>。
+              </div>
+            ) : null}
           </AsyncBoundary>
         </Card>
 

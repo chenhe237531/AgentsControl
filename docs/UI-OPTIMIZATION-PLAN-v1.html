@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AgentsControl 控制台 UI 优化产品开发计划 v1.0</title>
+<style>
+  :root {
+    --canvas: #f6f7f9; --surface: #ffffff; --line: #e4e7ed;
+    --ink: #1c1f26; --muted: #667085; --brand: #2f5cf6;
+    --ok: #12805c; --warn: #b45309; --danger: #b42318;
+    --p0: #b42318; --p1: #b45309; --p2: #12805c;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--canvas); color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    font-size: 14px; line-height: 1.75; -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 48px 32px 96px; }
+  header.doc { border-bottom: 2px solid var(--ink); padding-bottom: 24px; margin-bottom: 40px; }
+  header.doc h1 { font-size: 26px; margin: 0 0 8px; letter-spacing: -0.01em; }
+  header.doc .meta { color: var(--muted); font-size: 13px; }
+  header.doc .meta span { margin-right: 16px; }
+  h2 { font-size: 19px; margin: 56px 0 4px; padding-top: 16px; border-top: 1px solid var(--line); }
+  h2 .no { color: var(--brand); margin-right: 8px; font-variant-numeric: tabular-nums; }
+  h2 + .lead { color: var(--muted); margin: 0 0 20px; font-size: 13.5px; }
+  h3 { font-size: 15.5px; margin: 28px 0 10px; }
+  p { margin: 10px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0 22px; background: var(--surface); font-size: 13px; }
+  th, td { border: 1px solid var(--line); padding: 8px 12px; text-align: left; vertical-align: top; }
+  th { background: #f0f2f6; font-weight: 600; white-space: nowrap; }
+  td { line-height: 1.6; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; background: #eef1f6; padding: 1px 5px; border-radius: 4px; }
+  .tag { display: inline-block; font-size: 11px; font-weight: 600; padding: 1px 8px; border-radius: 999px; white-space: nowrap; }
+  .tag.p0 { background: #fdeceb; color: var(--p0); }
+  .tag.p1 { background: #fdf3e7; color: var(--p1); }
+  .tag.p2 { background: #e9f6f1; color: var(--p2); }
+  .tag.assump { background: #eef1f6; color: var(--muted); font-weight: 500; }
+  .tag.done { background: #e9f6f1; color: var(--ok); }
+  .tag.gap { background: #fdeceb; color: var(--danger); }
+  .card { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 18px 22px; margin: 14px 0; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 760px) { .grid2 { grid-template-columns: 1fr; } }
+  blockquote { margin: 14px 0; padding: 12px 18px; border-left: 3px solid var(--brand); background: #f2f5fe; border-radius: 0 8px 8px 0; color: #344054; }
+  blockquote p { margin: 4px 0; }
+  ul, ol { padding-left: 22px; margin: 8px 0; }
+  li { margin: 4px 0; }
+  /* 摘要卡 */
+  .summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin: 18px 0 8px; }
+  @media (max-width: 860px) { .summary { grid-template-columns: repeat(2, 1fr); } }
+  .summary .stat { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+  .summary .stat .v { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .summary .stat .k { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  /* 甘特图 */
+  .gantt { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 20px 22px; margin: 16px 0 24px; overflow-x: auto; }
+  .gantt .ghead, .gantt .grow { display: grid; grid-template-columns: 190px repeat(8, 1fr); min-width: 860px; align-items: center; }
+  .gantt .ghead { color: var(--muted); font-size: 11px; border-bottom: 1px solid var(--line); padding-bottom: 6px; margin-bottom: 10px; }
+  .gantt .grow { margin: 10px 0; font-size: 12.5px; }
+  .gantt .glabel { padding-right: 12px; }
+  .gantt .glabel b { display: block; font-size: 13px; }
+  .gantt .glabel span { color: var(--muted); font-size: 11.5px; }
+  .gantt .gtrack { grid-column: 2 / -1; display: grid; grid-template-columns: repeat(8, 1fr); height: 22px; }
+  .gantt .bar { border-radius: 5px; height: 100%; display: flex; align-items: center; justify-content: center; color: #fff; font-size: 11px; font-weight: 600; }
+  .gantt .bar.b0 { background: #667085; } .gantt .bar.b1 { background: var(--brand); }
+  .gantt .bar.b2 { background: #6b5bd6; } .gantt .bar.b3 { background: #0e7490; }
+  .gantt .bar.b4 { background: var(--ok); }
+  .gantt .ms { display: grid; grid-template-columns: 190px repeat(8, 1fr); min-width: 860px; margin-top: 12px; padding-top: 10px; border-top: 1px dashed var(--line); color: var(--muted); font-size: 11.5px; }
+  .gantt .ms div { padding-right: 8px; }
+  /* 流程图 */
+  .flow { display: flex; align-items: stretch; gap: 0; margin: 16px 0 24px; overflow-x: auto; }
+  .flow .step { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px; font-size: 12.5px; min-width: 130px; }
+  .flow .step b { display: block; font-size: 13px; margin-bottom: 2px; }
+  .flow .step span { color: var(--muted); font-size: 11.5px; }
+  .flow .arr { align-self: center; color: var(--muted); padding: 0 8px; flex: none; }
+  .ok-text { color: var(--ok); font-weight: 600; } .warn-text { color: var(--warn); font-weight: 600; } .danger-text { color: var(--danger); font-weight: 600; }
+  footer { margin-top: 72px; padding-top: 20px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="doc">
+  <h1>AgentsControl 控制台 UI 界面优化 · 产品开发计划</h1>
+  <div class="meta">
+    <span>版本 v1.0</span><span>2026-10-24</span><span>状态：待评审</span>
+    <span>上游依据：<code>docs/PRODUCT-DESIGN-v0.2.md</code>、<code>plan/W10.md</code>、<code>plan/W11.md</code>、<code>plan/W12.md</code>、<code>plan/STATUS.md</code></span>
+  </div>
+</header>
+
+<div class="summary">
+  <div class="stat"><div class="v">10 / 10</div><div class="k">页面骨架已交付（W10 完成），优化对象为存量页</div></div>
+  <div class="stat"><div class="v">4 / 10</div><div class="k">页面有 E2E 覆盖，6 页无冒烟保护</div></div>
+  <div class="stat"><div class="v">8 周</div><div class="k">计划周期（5 阶段）<span class="tag assump">Assumption，见 §8</span></div></div>
+  <div class="stat"><div class="v">0 处</div><div class="k">本计划触碰冻结文件的次数（nav.ts / router.py 走既有变更流程）</div></div>
+</div>
+
+<h2><span class="no">1</span>现状问题梳理与优化目标</h2>
+<p class="lead">先摆事实，再定目标。事实全部可在仓库中核对；无法现场核实的项标注 <span class="tag assump">Assumption / TBD</span>，由阶段 0 的审计动作闭环。</p>
+
+<h3>1.1 现状事实（已核对）</h3>
+<table>
+  <tr><th style="width:22%">维度</th><th>事实与证据</th><th style="width:30%">含义</th></tr>
+  <tr>
+    <td>页面交付</td>
+    <td>W10 已 7/7 完成：设计令牌、应用骨架、10 个业务页（今日/收件箱/目标/执行/团队/兵工厂/资产/账本/总视图/项目视图）、E2E 冒烟与 a11y。<code>plan/STATUS.md</code></td>
+    <td>本次是<b>存量优化</b>，不是从零建设；每页"能用了"，但未经专项设计评审</td>
+  </tr>
+  <tr>
+    <td>设计体系</td>
+    <td>令牌层（<code>globals.css</code>：canvas/surface/line/ink/muted/brand/ok/warn/danger，仅浅色）+ 原语层（<code>components/ui/index.tsx</code>：Card/Badge/Button/StatTile/Skeleton/EmptyState/ErrorState/ProgressBar/Segmented 等约 10 个），纪律为"页面不许自拼三态、不许写死颜色"</td>
+    <td>地基好；缺<b>复合组件层</b>（表格、表单组、Toast、确认弹窗、时间/金额格式化），缺暗色主题</td>
+  </tr>
+  <tr>
+    <td>测试覆盖</td>
+    <td>Playwright spec 仅 4 个：<code>today</code>、<code>inbox</code>、<code>execution</code>、<code>a11y</code>。<code>web/e2e/</code></td>
+    <td>6 个页面改动无安全网，UI 优化有破窗风险</td>
+  </tr>
+  <tr>
+    <td>效果度量</td>
+    <td>P0 毕业标准"日均使用 ≤10 分钟"无采集手段；W12 #6 已提案"使用度量采集"但未排期。<code>plan/W12.md §7.1</code></td>
+    <td><b>优化效果无基线</b>——不先接度量，优化无法证明有效</td>
+  </tr>
+  <tr>
+    <td>待排期依赖</td>
+    <td>W11（缺席契约/回归简报/通知中心/采集桥等 7 issue）与 W12（13 项缺口）均为 PROPOSED；其中 W10-I08 缺席页 UI、W07-I07 决策排班与前端强相关。<code>plan/W11.md / W12.md</code></td>
+    <td>部分 UI 优化的后端数据源尚不存在，需 mock 先行或等 Marshal 排期</td>
+  </tr>
+  <tr>
+    <td>产品灵魂</td>
+    <td>v0.2 第一性：带宽是第一约束（日决策 8–15 个、压缩比 200:1）、L0–L3 决策分级、决策排班（上午宜 L0、23:00–07:00 禁 L0）、"产品要敢于说今天别做了"。<code>PRODUCT-DESIGN-v0.2 §0/§3</code></td>
+    <td>UI 优化的北极星是<b>压缩信息</b>，不是美化——这是与常规"后台美化"的根本区别</td>
+  </tr>
+</table>
+
+<h3>1.2 问题清单（阶段 0 审计需逐项确认或推翻）</h3>
+<table>
+  <tr><th style="width:6%">#</th><th style="width:34%">疑似问题</th><th>确认方式</th><th style="width:14%">初判严重度</th></tr>
+  <tr><td>Q1</td><td>骨架期 4 个 Wave 交付 10 页，交互深度（键盘操作、批量处理、空态文案、加载粒度）不齐</td><td>10 页走查清单逐页过</td><td><span class="warn-text">中</span></td></tr>
+  <tr><td>Q2</td><td>无暗色主题，但产品设计允许晚间使用 Inbox（"Inbox 永远可用"），夜间场景刺眼 <span class="tag assump">TBD</span></td><td>令牌层审计 + 晚间使用实测</td><td><span class="warn-text">中</span></td></tr>
+  <tr><td>Q3</td><td>小屏/移动端适配未验证（采集入口在手机，控制台回看也可能在手机）<span class="tag assump">TBD</span></td><td>375px/768px 断点走查</td><td><span class="warn-text">中</span></td></tr>
+  <tr><td>Q4</td><td>"决策排班"未体现在 UI：立项按钮应只在上午高亮、下午不可逆操作二次确认（v0.2 §3.4；后端条款 W07-I04 只有深夜熔断）</td><td>对照 §3.4 逐条查页面</td><td><span class="danger-text">高</span>（背离产品原则）</td></tr>
+  <tr><td>Q5</td><td>复合组件缺失导致各页重复实现（如时间显示、金额、状态色映射），优化时改动面会失控 <span class="tag assump">TBD</span></td><td>组件盘点（grep 内联样式/重复模式）</td><td><span class="warn-text">中</span></td></tr>
+  <tr><td>Q6</td><td>今日页"决策负载/注意力余额/异常数"三数字与"8 条决策卡"的信息层级是否 5 秒可读</td><td>5 秒测试（给自己）</td><td><span class="danger-text">高</span>（P0 毕业标准所在页）</td></tr>
+  <tr><td>Q7</td><td>兵工厂雷达图、项目视图 React Flow 拓扑是信息密度最高的两处，可读性与性能未验证 <span class="tag assump">TBD</span></td><td>真实数据压测 + 可读性走查</td><td><span class="warn-text">中</span></td></tr>
+</table>
+
+<h3>1.3 优化目标（可观测，不虚化）</h3>
+<p>不写"提升体验"这类不可验收的目标。本期优化完成后，以下每条都应能被直接观察或测量：</p>
+<table>
+  <tr><th style="width:6%">#</th><th style="width:44%">目标（观测口径）</th><th>验收方式</th></tr>
+  <tr><td>G1</td><td>今日页 5 秒内可回答"今天有什么事非我不可"（决策负载 / 注意力余额 / 异常数一眼可读）</td><td>5 秒测试 + 使用度量中今日页停留时长<b>不升反降</b></td></tr>
+  <tr><td>G2</td><td>每个页面保持"一页一问题"（v0.2 §6），页首即答案，下钻不超过 2 层</td><td>逐页对照"问题句"走查签字</td></tr>
+  <tr><td>G3</td><td>10/10 页面有 E2E 冒烟；a11y spec 覆盖全部页面</td><td>CI 门禁绿</td></tr>
+  <tr><td>G4</td><td>设计系统补齐全量复合组件后，页面层不再出现内联 hex 色值与自拼三态</td><td>lint 规则 + grep 审计为零</td></tr>
+  <tr><td>G5</td><td>使用度量上线，产出优化前后对照周报（页面停留、决策耗时、访问序列）</td><td>度量面板可查，P0 毕业标准可测量</td></tr>
+  <tr><td>G6</td><td>决策排班在 UI 落地：上午 L0 入口高亮、下午不可逆操作二次确认、23:00–07:00 L0 只记录不出结论</td><td>分时段人工验收 + E2E 时间 mock</td></tr>
+</table>
+<blockquote><p><b>边界声明</b>：本期不追求视觉风格翻新。品牌色、圆角、字体尺度等令牌只做"补缺口"（暗色、图表色阶），不做"换皮肤"。判断标准：每个改动都要能回答"它帮你少想了什么"。</p></blockquote>
+
+<h2><span class="no">2</span>界面设计与交互优化的具体范围</h2>
+<p class="lead">三层范围：设计体系层 → 交互机制层 → 页面层。体系层先行，页面层消费，避免 10 个页面各改一套。</p>
+
+<h3>2.1 设计体系层（设计令牌 v1.1 + 组件库 v1.0）</h3>
+<table>
+  <tr><th style="width:24%">范围项</th><th>内容</th><th style="width:18%">性质</th></tr>
+  <tr><td>暗色令牌组</td><td>为现有 9 个语义令牌生成暗色对照组（<code>prefers-color-scheme</code> + 手动切换），组件零改动——这是语义化令牌的红利</td><td>新增</td></tr>
+  <tr><td>复合组件</td><td>数据表格（排序/空态/骨架行）、表单组（字段+校验+错误）、Toast/通知条、确认弹窗（含"不可逆操作"红色变体）、Drawer 详情、时间/金额/时长格式化器、状态色映射函数（复用 Tone）</td><td>新增</td></tr>
+  <tr><td>信息密度规范</td><td>控制台保持高密度（正文 13px 档）作为默认；只定义"关键数字"放大规则（今日页三数字），不全局放大字号</td><td>规范</td></tr>
+  <tr><td>状态与反馈</td><td>统一"加载/空/错误/重试"四态文案与视觉；告警一律 danger，不用 warn 冒充（沿用 globals.css 注释纪律）</td><td>收口</td></tr>
+  <tr><td>动效预算</td><td>只保留状态过渡（≤200ms），禁止装饰性动效；<code>prefers-reduced-motion</code> 全量降级</td><td>规范</td></tr>
+</table>
+
+<h3>2.2 交互机制层（带宽机制的 UI 表达，本期最独特部分）</h3>
+<table>
+  <tr><th style="width:24%">机制</th><th>UI 行为</th><th style="width:22%">依据 / 依赖</th></tr>
+  <tr><td>决策分级显形</td><td>L0/L1 决策卡有明确视觉分级与"机器已初审"标记；L2/L3 默认折叠为一行统计，不逐条展示</td><td>v0.2 §3.1；后端已有（W07-I03）</td></tr>
+  <tr><td>决策排班</td><td>上午（9–11）L0 入口高亮；下午不可逆操作二次确认；23:00–07:00 L0 不出结论只记"待明日确认"</td><td>v0.2 §3.4；依赖 W07-I07 排班接口 <span class="tag assump">TBD 未排期</span>，缺则前端本地时段规则先行</td></tr>
+  <tr><td>熔断反馈</td><td>触发带宽熔断时，页面顶部一条"今天到此为止"，非紧急项自动转明日队列，不做模态打断</td><td>v0.2 §3.3；后端已有（W07-I04）</td></tr>
+  <tr><td>异常优先</td><td>执行页默认只显示异常（卡住/失败/超预算），正常任务折叠为一行统计</td><td>v0.2 §6 页面 4；后端已有</td></tr>
+  <tr><td>双币种同屏</td><td>账本页"钱"与"注意力（min/outcome）"同屏对照，不允许分两个 Tab</td><td>v0.2 §6 页面 8；后端已有（W07-I01/I02）</td></tr>
+</table>
+
+<h3>2.3 页面层（10 页 + 1 个候选页）</h3>
+<p>逐页优化清单见 §3 优先级表。共性要求：页首 3 秒内给出该页"问题句"的直接答案；空态给出下一步动作而非装饰插画；所有异步区走 AsyncBoundary 三态。</p>
+
+<h3>2.4 明确不做（防范围蔓延，与 W12 §9 纪律一致）</h3>
+<ul>
+  <li>不引入通用图表平台 / ECharts 全家桶（只做现有三视图的打磨，W12 已否决）</li>
+  <li>不换组件库、不做主题引擎、不做用户自定义皮肤</li>
+  <li>不做小程序三屏（T5 独立排期，依赖 ICP 备案）</li>
+  <li>不改信息架构：10 页 + 分组（指挥/执行/资产/视图）不动；新增"缺席"导航项若发生，走 shared-registry 变更请求（nav.ts 是冻结文件）</li>
+  <li>不做营销式落地页、不做动效包装</li>
+</ul>
+
+<h2><span class="no">3</span>页面与功能模块优先级划分</h2>
+<p class="lead">优先级判据只有一条：<b>离"带宽闭环"越近越优先</b>。P0 = P0 毕业标准（日均 ≤10 分钟看板 + 立项）直接依赖的页面。</p>
+<table>
+  <tr><th style="width:8%">优先级</th><th style="width:20%">页面 / 模块</th><th>优化重点</th><th style="width:26%">依据</th></tr>
+  <tr><td><span class="tag p0">P0</span></td><td>设计体系层（§2.1 全部）</td><td>令牌 v1.1、复合组件、暗色</td><td>一切页面优化的前置，一次投入十页受益</td></tr>
+  <tr><td><span class="tag p0">P0</span></td><td>今日</td><td>三数字信息层级、决策卡分级显形、熔断条、决策排班表达</td><td>P0 毕业标准所在页；Q4/Q6 高危问题所在</td></tr>
+  <tr><td><span class="tag p0">P0</span></td><td>收件箱</td><td>≤30 秒记录动线、AI 三问交互、一键转目标/兴趣池</td><td>体感入口，链路起点（v0.2 §13"只批一条就批这条"）</td></tr>
+  <tr><td><span class="tag p0">P0</span></td><td>目标</td><td>双轨分栏、止损状态可视、预算/天数进度、KPI 填报入口（W12 #5 联动）</td><td>"值不值得继续"是 L0 最高频决策</td></tr>
+  <tr><td><span class="tag p0">P0</span></td><td>使用度量埋点</td><td>页面级事件（无 PII、失败静默）</td><td>W12 #6；G5 的载体，<b>必须先于页面优化上线</b>以取得基线</td></tr>
+  <tr><td><span class="tag p1">P1</span></td><td>执行</td><td>异常优先布局、会话视图（W06-I06 数据）可读性</td><td>"活干到哪了"是日检第二高频</td></tr>
+  <tr><td><span class="tag p1">P1</span></td><td>账本</td><td>双币种同屏、六分项结构、对账导出入口</td><td>每周复盘场景</td></tr>
+  <tr><td><span class="tag p1">P1</span></td><td>兵工厂</td><td>雷达图可读性、设备池占用、比价信息层级</td><td>Q7；周频使用</td></tr>
+  <tr><td><span class="tag p1">P1</span></td><td>团队</td><td>绩效卡、退役队列状态</td><td>周频使用</td></tr>
+  <tr><td><span class="tag p2">P2</span></td><td>资产 / 总视图 / 项目视图</td><td>资产库检索入口、React Flow 拓扑可读性与性能</td><td>低频或已有专项（W08/W10-I06 刚交付）</td></tr>
+  <tr><td><span class="tag p2">P2</span></td><td>缺席页 + 排队区（候选新页）</td><td>回归简报 ≤3 条决策、"全部知道了"一键归档</td><td>W10-I08，依赖 W11-I01/I02 后端 <span class="tag assump">TBD 待 Marshal 排期</span>；前端可 mock 先行</td></tr>
+</table>
+
+<h2><span class="no">4</span>分阶段开发计划、里程碑与时间安排</h2>
+<p class="lead">5 个阶段、8 周。<span class="tag assump">Assumption：前端 1 人全程 + 设计 0.5 人（阶段 0–1 与评审节点）+ 后端 0.5 人（度量聚合与排班接口）</span>。每阶段结束都是可独立使用的状态，人力波动时可整阶段顺延而不烂尾。</p>
+
+<div class="gantt">
+  <div class="ghead">
+    <div>阶段</div><div>W1<br>10/26</div><div>W2<br>11/02</div><div>W3<br>11/09</div><div>W4<br>11/16</div><div>W5<br>11/23</div><div>W6<br>11/30</div><div>W7<br>12/07</div><div>W8<br>12/14</div>
+  </div>
+  <div class="grow"><div class="glabel"><b>阶段 0 · 审计与基线</b><span>走查 / 令牌缺口 / 度量上线</span></div><div class="gtrack"><div class="bar b0">M0</div></div></div>
+  <div class="grow"><div class="glabel"><b>阶段 1 · 体系 + 指挥组</b><span>组件库 v1.0 / 暗色 / 今日·收件箱·目标</span></div><div class="gtrack"><div></div><div class="bar b1" style="grid-column: span 2">M1</div></div></div>
+  <div class="grow"><div class="glabel"><b>阶段 2 · 执行组 + 资产组</b><span>执行·账本·兵工厂·团队 + E2E 补齐</span></div><div class="gtrack"><div></div><div></div><div></div><div class="bar b2" style="grid-column: span 2">M2</div></div></div>
+  <div class="grow"><div class="glabel"><b>阶段 3 · 视图 + 响应式 + W11</b><span>总视图·项目视图 / 移动端 / 缺席页 mock</span></div><div class="gtrack"><div></div><div></div><div></div><div></div><div></div><div class="bar b3" style="grid-column: span 2">M3</div></div></div>
+  <div class="grow"><div class="glabel"><b>阶段 4 · 联调收口与发布</b><span>性能预算 / 视觉回归 / 灰度 / 上线</span></div><div class="gtrack"><div></div><div></div><div></div><div></div><div></div><div></div><div></div><div class="bar b4">M4</div></div></div>
+  <div class="ms">
+    <div><b>里程碑</b></div>
+    <div>M0：审计报告 + 度量在线</div><div></div>
+    <div>M1：组件库冻结 + 指挥组验收</div><div></div>
+    <div>M2：E2E 10/10</div><div></div>
+    <div>M3：响应式达标</div><div></div>
+    <div>M4：生产发布</div>
+  </div>
+</div>
+
+<h3>4.1 阶段 0 · 审计与基线（W1，10/26–10/30）</h3>
+<table>
+  <tr><th style="width:50%">工作项</th><th>出口标准（里程碑 M0）</th></tr>
+  <tr><td>① 10 页走查：逐页核对"问题句能否 5 秒回答"，登记 Q1–Q7 的结论；② 组件盘点：grep 内联色值/自拼三态/重复模式，产出复合组件最终清单；③ 令牌缺口：暗色对照组设计稿</td><td rowspan="2">《UI 审计报告》签字归档；使用度量埋点上线生产（先于一切页面改动，取得基线数据）；暗色令牌组合入 globals.css 评审通过</td></tr>
+  <tr><td>④ 使用度量接入（W12 #6）：页面级事件上报（停留时长、访问序列，无 PII、失败静默）+ 后端聚合周报</td></tr>
+</table>
+<h3>4.2 阶段 1 · 设计系统加固 + 指挥组页面（W2–W3，11/02–11/13）</h3>
+<table>
+  <tr><th style="width:50%">工作项</th><th>出口标准（里程碑 M1）</th></tr>
+  <tr><td>① 组件库 v1.0：表格/表单/Toast/确认弹窗/Drawer/格式化器全部入库并替换既有重复实现；② 暗色主题上线；③ 今日页：三数字层级、决策卡分级、熔断条、排班表达（后端排班接口未就绪则前端本地时段规则先行，标注 TODO 对接 W07-I07）；④ 收件箱：记录动线 ≤30 秒、三问交互打磨；⑤ 目标页：双轨分栏、止损可视、KPI 填报入口</td><td>组件库 API 冻结（破改需设计+前端双签字）；G1/G6 人工验收通过；指挥组三页 E2E 更新通过；页面层内联色值 grep 为零</td></tr>
+</table>
+<h3>4.3 阶段 2 · 执行组与资产组页面（W4–W5，11/16–11/27）</h3>
+<table>
+  <tr><th style="width:50%">工作项</th><th>出口标准（里程碑 M2）</th></tr>
+  <tr><td>① 执行页异常优先布局 + 会话视图可读性；② 账本双币种同屏；③ 兵工厂雷达图与设备池；④ 团队页绩效卡；⑤ 补齐 6 个页面 E2E 冒烟 + a11y 扩展至全站</td><td>四页走查签字；<b>E2E 10/10 + a11y 全站入 CI 门禁</b>（G3 达成）</td></tr>
+</table>
+<h3>4.4 阶段 3 · 视图组 + 响应式 + W11 衔接（W6–W7，11/30–12/11）</h3>
+<table>
+  <tr><th style="width:50%">工作项</th><th>出口标准（里程碑 M3）</th></tr>
+  <tr><td>① 总视图/项目视图打磨（React Flow 拓扑可读性、节点多时性能）；② 375/768px 断点全站响应式；③ 缺席页 + 排队区 UI：W11 已排期则真接口联调，未排期则 mock 数据驱动先行，接口契约按 W11-I01/I02 草案冻结</td><td>G2 全站核对完成；移动断点走查通过；缺席页达"接口一到即可联调"状态</td></tr>
+</table>
+<h3>4.5 阶段 4 · 联调收口与上线（W8，12/14–12/18）</h3>
+<table>
+  <tr><th style="width:50%">工作项</th><th>出口标准（里程碑 M4）</th></tr>
+  <tr><td>① 端到端联调（§6）；② 性能预算校验；③ 视觉回归基线建立；④ staging 自用灰度 3 天 + 度量对照；⑤ 生产发布 + 迭代 backlog 归档</td><td>全部 G1–G6 复核通过；生产发布完成；《优化效果首周对照》产出（对比阶段 0 基线）</td></tr>
+</table>
+
+<h2><span class="no">5</span>开发与设计协作分工</h2>
+<p class="lead">沿用仓库既有的窗口制与 Merge Marshal 机制，不新造流程。本计划在仓库语境下相当于一个跨页面优化波次，冻结文件纪律必须遵守。</p>
+<table>
+  <tr><th style="width:16%">角色</th><th style="width:34%">职责</th><th>关键交付物与节奏</th></tr>
+  <tr><td>设计（0.5 人）</td><td>信息架构守卫（一页一问题不被破坏）、令牌 v1.1 与暗色组、复合组件视觉规范、阶段末走查签字</td><td>阶段 0 全程在场；之后每阶段末 1 次走查会；令牌/组件 API 变更双签字</td></tr>
+  <tr><td>前端（1 人）</td><td>组件库与页面实现、度量埋点、E2E/a11y 补齐、响应式</td><td>按 §4 阶段交付；每页 PR 附"该页问题句 5 秒可读"自测截图</td></tr>
+  <tr><td>后端（0.5 人）</td><td>度量聚合接口（W12 #6 后半）、决策排班接口（W07-I07 若被 Marshal 采纳）、缺席/简报接口（W11 若排期）</td><td>接口契约先行（OpenAPI 快照），前端按契约 mock 开发，不阻塞</td></tr>
+  <tr><td>Merge Marshal</td><td>冻结文件变更裁决（缺席导航项入 nav.ts、新模块入 router.py）、W11/W12 排期决策、Wave 边界放行</td><td>决策点：W1 末决定是否本波次纳入 W10-I08/W07-I07；W5 末决定 W11 整体排期</td></tr>
+</table>
+<h3>5.1 协作规则</h3>
+<ul>
+  <li><b>契约先行</b>：任何"前端等后端"的依赖，先冻结 OpenAPI 契约，前端用 <code>openapi-typescript</code> 生成类型 + mock 开发；后端到位后只联调不改设计。</li>
+  <li><b>评审节点</b>：每阶段末一次联合走查（设计+前端+产品本人），过出口标准才进下一阶段；G 系列目标逐项打勾。</li>
+  <li><b>冻结文件</b>：本计划默认不改 <code>nav.ts</code> / <code>router.py</code>；确需新增导航（缺席页）时，单独 PR 走 shared-registry 变更请求，不夹带在页面优化 PR 里。</li>
+  <li><b>争议裁决</b>：视觉品味争议由"是否减少你的认知负担"裁决；无法裁决时回到 v0.2 原文，原文没有的记录为新的待拍板项（§9）。</li>
+</ul>
+
+<h2><span class="no">6</span>前后端联调与测试验证</h2>
+<h3>6.1 联调机制</h3>
+<div class="flow">
+  <div class="step"><b>OpenAPI 契约</b><span>后端先出快照，gen:api 生成 schema.d.ts</span></div><div class="arr">→</div>
+  <div class="step"><b>前端 mock 开发</b><span>react-query + apiFetch，三态走 AsyncBoundary</span></div><div class="arr">→</div>
+  <div class="step"><b>本地联调</b><span>docker compose（db/redis/api/web）</span></div><div class="arr">→</div>
+  <div class="step"><b>staging 验证</b><span>真实数据 + 度量埋点回传</span></div><div class="arr">→</div>
+  <div class="step"><b>生产灰度</b><span>自用 3 天 + 指标对照</span></div>
+</div>
+<ul>
+  <li>错误语义统一走 <code>apiFetch</code> 的错误映射与重试策略，页面不自定义错误码处理；新增错误码须先登记 <code>docs/ERROR-CODES.md</code>。</li>
+  <li>联调清单按依赖排序：度量聚合（阶段 0）→ 排班接口（阶段 1 尾，可降级为前端本地规则）→ KPI 填报（阶段 1，W12 #5 若采纳）→ 缺席/简报（阶段 3，W11 若排期）。每项有"未就绪降级方案"，无一阻塞主线。</li>
+</ul>
+<h3>6.2 测试验证分层</h3>
+<table>
+  <tr><th style="width:18%">层</th><th style="width:44%">内容</th><th>门禁</th></tr>
+  <tr><td>静态</td><td><code>typecheck</code> + <code>build</code>；新增 lint 规则：禁止页面层内联 hex、禁止自拼三态</td><td>CI 必过</td></tr>
+  <tr><td>E2E</td><td>Playwright 由 4 spec 补齐至 10 页冒烟；关键交互（三问转目标、熔断出现、排班高亮、不可逆二次确认）用时间 mock 做分时段断言</td><td>CI 必过（阶段 2 末起）</td></tr>
+  <tr><td>a11y</td><td>现有 a11y spec 扩展至全站：对比度（暗色组必测）、键盘可达、focus 可见、reduced-motion 降级</td><td>CI 必过（阶段 2 末起）</td></tr>
+  <tr><td>视觉回归</td><td>对 10 页建立截图基线（Playwright 截图对比即可，不引入新平台）；令牌变更必须全量回归一次</td><td>阶段 4 起入 CI</td></tr>
+  <tr><td>性能预算</td><td>首屏 LCP ≤2.5s（staging 实测）；单页 JS 增量超预算（建议 ≤30KB gzip/页 <span class="tag assump">Assumption</span>）需在 PR 说明理由</td><td>阶段 4 校验</td></tr>
+  <tr><td>人工验收</td><td>每页"问题句 5 秒测试"；G1–G6 逐项签字</td><td>每阶段末</td></tr>
+</table>
+
+<h2><span class="no">7</span>上线发布与后续迭代安排</h2>
+<table>
+  <tr><th style="width:20%">环节</th><th>安排</th></tr>
+  <tr><td>发布路径</td><td>复用 W09 CI 门禁 + W12 #3 部署流水线（若该提案已落地；未落地则沿用现有 <code>docker compose pull && up -d</code> 手动路径并在风险表登记）。页面级改动独立 PR、独立可回滚（镜像 tag）。</td></tr>
+  <tr><td>灰度策略</td><td>单人系统，灰度 = <b>staging 自用 3 天</b>：每日正常使用，度量埋点回传，与阶段 0 基线对照（停留时长、决策耗时、异常发现数）。无回归即推生产。</td></tr>
+  <tr><td>上线顺序</td><td>度量埋点（阶段 0 末，最先）→ 令牌+暗色+组件库（阶段 1 中，纯体系可单独发）→ 指挥组三页 → 其余六页 → 视图与响应式 → 缺席页（接口就绪后）。每步独立发布，不做"大爆炸"合版。</td></tr>
+  <tr><td>效果回看</td><td>发布后第 1、4 周各出一次对照周报（G1–G6 口径）；结果直接回答"这波优化值不值"，作为是否立项下一波 UI 工作的依据。</td></tr>
+  <tr><td>后续迭代</td><td>① 缺席页真接口联调（随 W11 排期）；② 决策排班后端化（W07-I07，替换前端本地规则）；③ KPI 自动采集后的目标页增强（W12 #5 P2 部分）；④ 移动端"只看只批"体验深化（等 T5 小程序决策）。迭代需求一律进 backlog 由 Marshal 在 Wave 边界排期，不在本计划内追加。</td></tr>
+</table>
+
+<h2><span class="no">8</span>资源需求</h2>
+<table>
+  <tr><th style="width:20%">资源</th><th style="width:24%">需求量 <span class="tag assump">Assumption</span></th><th>说明</th></tr>
+  <tr><td>前端</td><td>1 人 × 8 周</td><td>全程；组件库与页面实现主力</td></tr>
+  <tr><td>设计</td><td>0.5 人 × 8 周</td><td>阶段 0–1 密集（令牌/组件规范），之后评审节点在场</td></tr>
+  <tr><td>后端</td><td>0.5 人 × 4 周</td><td>度量聚合（W1）、排班接口（W3）、缺席接口联调支持（W6–7，若 W11 排期）</td></tr>
+  <tr><td>Marshal</td><td>2 个决策点</td><td>W1 末、W5 末各一次（§5）</td></tr>
+  <tr><td>工具 / 基础设施</td><td>0 新增采购</td><td>Playwright 截图对比 + 现有 CI 足够；不引入 Chromatic/图表库/主题引擎。staging 环境沿用现有 compose。</td></tr>
+  <tr><td>外部依赖</td><td colspan="2">W11/W12 排期决策（影响阶段 1 尾与阶段 3 的范围，但均有降级方案，不阻塞）</td></tr>
+</table>
+
+<h2><span class="no">9</span>风险与应对措施</h2>
+<table>
+  <tr><th style="width:26%">风险</th><th style="width:8%">概率</th><th style="width:8%">影响</th><th>应对</th></tr>
+  <tr><td>R1 · 优化跑偏成"美化"，违背带宽第一原则</td><td><span class="warn-text">中</span></td><td><span class="danger-text">极高</span></td><td>每条改动须回答"帮你少想了什么"；验收绑 G1–G6 与度量对照，停留时长上升即视为负优化回滚；§2.4 不做清单明文排除换肤类工作</td></tr>
+  <tr><td>R2 · 无基线导致效果不可证</td><td>高（若不处理）</td><td><span class="danger-text">高</span></td><td>度量埋点列为阶段 0 且<b>先于一切页面改动上线</b>；这是全计划最不能砍的一项</td></tr>
+  <tr><td>R3 · W11/W12 未排期，排班/缺席接口不到位</td><td><span class="warn-text">中</span></td><td><span class="warn-text">中</span></td><td>依赖矩阵全部备降级方案（前端本地排班规则、mock 缺席页）；Marshal 两个决策点显式处理；主线不被任何外部提案阻塞</td></tr>
+  <tr><td>R4 · 大改破坏现有页面（6 页无 E2E）</td><td><span class="warn-text">中</span></td><td><span class="danger-text">高</span></td><td>顺序倒置：阶段 0/1 先补关键路径 E2E，组件库替换逐页 PR + 截图基线；任何 PR 不许同 PR 内"换组件 + 改交互"</td></tr>
+  <tr><td>R5 · 范围蔓延（图表库、主题引擎、顺手重构）</td><td>高</td><td><span class="warn-text">中</span></td><td>§2.4 不做清单 + W12 §9 既有纪律；新想法一律进 backlog，Wave 边界再评</td></tr>
+  <tr><td>R6 · 人力波动（单人/小团队项目）</td><td><span class="warn-text">中</span></td><td><span class="warn-text">中</span></td><td>阶段按"可独立交付"切分，砍顺序从后往前（先砍阶段 3 视图打磨，保阶段 0–1）；任一阶段结束系统都处于一致可用态</td></tr>
+  <tr><td>R7 · 令牌变更引发全站视觉漂移</td><td>低</td><td><span class="warn-text">中</span></td><td>令牌/组件 API 双签字 + 变更必跑全量截图回归；暗色组先行单独发布验证</td></tr>
+  <tr><td>R8 · 性能劣化（拓扑页/雷达图真实数据量）</td><td><span class="warn-text">中</span></td><td><span class="warn-text">中</span></td><td>阶段 3 用真实量级数据压测；性能预算入阶段 4 门禁；超预算降级策略（节点聚合/虚拟化）预先写在出口标准里</td></tr>
+</table>
+
+<h2><span class="no">10</span>待拍板决策</h2>
+<table>
+  <tr><th style="width:6%">#</th><th style="width:34%">决策</th><th style="width:34%">选项</th><th>建议</th></tr>
+  <tr><td>D1</td><td>暗色主题是否本期做</td><td>做 / 缓做</td><td><b>做</b>——令牌语义化后成本低，且"Inbox 永远可用"含夜间场景；若阶段 0 审计证明夜间零使用再缓</td></tr>
+  <tr><td>D2</td><td>W07-I07 排班接口是否本波次做</td><td>后端做 / 前端本地规则先行</td><td><b>本地规则先行</b>，接口列入 W11 波次；W1 末 Marshal 决策</td></tr>
+  <tr><td>D3</td><td>缺席页是否本波次做（含 nav.ts 变更）</td><td>做 / mock 先行 / 缓</td><td><b>mock 先行</b>：不动冻结文件、不阻塞 W11；接口就绪后升级真联调</td></tr>
+  <tr><td>D4</td><td>移动端目标深度</td><td>可读 / 可批 / 可操作</td><td><b>可读 + 可批</b>（决策卡可批准/否决）；复杂操作留桌面与 T5 小程序</td></tr>
+  <tr><td>D5</td><td>人力假设是否成立</td><td>确认 1+0.5+0.5 / 调整</td><td><span class="tag assump">TBD</span> 若不成立，按 R6 从后往前砍阶段，重排时间表</td></tr>
+</table>
+
+<footer>
+  <p>本计划遵循仓库纪律：不改冻结文件（nav.ts / router.py / windows.yaml 的变更均走 shared-registry 与 Marshal 流程）；与 W11/W12 提案是衔接关系而非替代关系。所有标注 <span class="tag assump">Assumption / TBD</span> 的项需在阶段 0 或对应决策点闭环。</p>
+  <p>引用：docs/PRODUCT-DESIGN-v0.2.md §0/§3/§6/§8 · plan/STATUS.md（W01–W10 完成态）· plan/W11.md §4/§5 · plan/W12.md §2/§7.1/§9 · web/src/app/globals.css · web/src/components/ui/index.tsx · web/e2e/</p>
+</footer>
+
+</div>
+</body>
+</html>

@@ -13,7 +13,7 @@ import { useState } from "react";
 
 import { AsyncBoundary } from "@/components/AsyncBoundary";
 import { RadarChart } from "@/components/charts/RadarChart";
-import { Badge, Button, Card, CardHeader, Segmented } from "@/components/ui";
+import { Badge, Button, Card, CardHeader, ConfirmDialog, Segmented } from "@/components/ui";
 import { useCeiling, useDrift, useRadar, useRunEvals, useSkills } from "@/lib/api/hooks";
 import { percent } from "@/lib/format";
 
@@ -27,6 +27,7 @@ const CEILING_TONE = {
 export function ArsenalView() {
   const [week, setWeek] = useState<string | undefined>(undefined);
   const [model, setModel] = useState<string>("");
+  const [confirmingRun, setConfirmingRun] = useState(false);
   const radar = useRadar(week);
   const ceiling = useCeiling(week);
   const skills = useSkills();
@@ -36,9 +37,14 @@ export function ArsenalView() {
   const models = radar.data?.models ?? [];
   const selected = model || models[0] || "";
 
+  const startRun = (): void => {
+    run.mutate(models.length ? models : ["claude-opus-4.5", "gpt-5.1", "gemini-3-pro"]);
+    setConfirmingRun(false);
+  };
+
   return (
     <div className="mx-auto max-w-6xl">
-      <header className="mb-4 flex items-end justify-between">
+      <header className="mb-4 flex flex-wrap items-end justify-between gap-2">
         <div>
           <h1 className="text-xl font-semibold tracking-tight">兵工厂</h1>
           <p className="mt-1 text-[12px] text-muted">
@@ -47,11 +53,7 @@ export function ArsenalView() {
         </div>
         <div className="flex items-center gap-2">
           <Badge tone="neutral">{radar.data?.week ?? "本周"}</Badge>
-          <Button
-            variant="primary"
-            onClick={() => run.mutate(models.length ? models : ["claude-opus-4.5", "gpt-5.1", "gemini-3-pro"])}
-            disabled={run.isPending}
-          >
+          <Button variant="primary" onClick={() => setConfirmingRun(true)} disabled={run.isPending}>
             {run.isPending ? "已提交…" : "跑一轮评测"}
           </Button>
         </div>
@@ -197,6 +199,18 @@ export function ArsenalView() {
           </AsyncBoundary>
         </Card>
       </div>
+
+      {/* 跑评测是真实花钱动作（L1 级），成本上限先亮出来再动手 */}
+      <ConfirmDialog
+        open={confirmingRun}
+        title="跑一轮评测？"
+        body={`20 题 × ${models.length || 3} 模型，成本上限 ¥20，约 10 分钟跑完。评测会消耗真实模型额度，确认启动？`}
+        confirmLabel="确认启动"
+        tone="danger"
+        busy={run.isPending}
+        onCancel={() => setConfirmingRun(false)}
+        onConfirm={startRun}
+      />
     </div>
   );
 }

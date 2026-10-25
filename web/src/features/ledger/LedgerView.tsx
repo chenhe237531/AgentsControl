@@ -11,9 +11,10 @@
 import { useMemo, useState } from "react";
 
 import { AsyncBoundary } from "@/components/AsyncBoundary";
-import { Badge, Card, CardHeader, ProgressBar, Segmented, StatTile } from "@/components/ui";
+import { Badge, Button, Card, CardHeader, ProgressBar, Segmented, StatTile, useToast } from "@/components/ui";
 import { useLedger } from "@/lib/api/hooks";
 import { CATEGORY_LABEL, yuan } from "@/lib/format";
+import { useMounted } from "@/lib/use-mounted";
 
 const CATEGORIES = ["subscription", "tools", "device", "rework", "qc", "labor"] as const;
 
@@ -28,23 +29,65 @@ function recentPeriods(count = 4): { value: string; label: string }[] {
   return out;
 }
 
+/** 前端导出本期汇总 CSV（明细级对账导出待 W07-I06，这里先给汇总口径） */
+function exportCsv(period: string, data: NonNullable<ReturnType<typeof useLedger>["data"]>): void {
+  const rows: string[][] = [
+    ["期间", period],
+    ["币种", data.currency ?? "CNY"],
+    [],
+    ["分类", "金额"],
+    ...(["subscription", "tools", "device", "rework", "qc", "labor"] as const).map((c) => [
+      CATEGORY_LABEL[c] ?? c,
+      (data.categories[c] ?? 0).toFixed(2),
+    ]),
+    ["合计", data.total.toFixed(2)],
+    [],
+    ["注意力投入(分钟)", String(data.attention?.minutes ?? "")],
+    ["达标产出", String(data.attention?.outcomes ?? "")],
+    ["min/outcome", data.attention?.min_per_outcome != null ? data.attention.min_per_outcome.toFixed(2) : ""],
+  ];
+  const csv = `\uFEFF${rows.map((r) => r.join(",")).join("\n")}`;
+  const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `ledger-${period}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 export function LedgerView() {
-  const periods = useMemo(() => recentPeriods(), []);
-  const [period, setPeriod] = useState(periods[0]?.value);
+  // 月份列表依赖本地时钟（且构建容器 TZ=UTC）：mount 后再算，见 use-mounted.ts
+  const mounted = useMounted();
+  const periods = useMemo(() => (mounted ? recentPeriods() : []), [mounted]);
+  const [selected, setSelected] = useState<string | undefined>(undefined);
+  const period = selected ?? periods[0]?.value;
   const ledger = useLedger(period);
+  const toast = useToast();
   const attention = ledger.data?.attention;
   const total = ledger.data?.total ?? 0;
 
   return (
     <div className="mx-auto max-w-5xl">
-      <header className="mb-4 flex items-end justify-between">
+      <header className="mb-4 flex flex-wrap items-end justify-between gap-2">
         <div>
           <h1 className="text-xl font-semibold tracking-tight">账本</h1>
           <p className="mt-1 text-[12px] text-muted">
             两个币种：钱可以再赚，你的下午不能。
           </p>
         </div>
-        <Segmented options={periods} value={period ?? ""} onChange={setPeriod} />
+        <div className="flex items-center gap-2">
+          <Button
+            onClick={() => {
+              if (!ledger.data) return;
+              exportCsv(period ?? "", ledger.data);
+              toast.push({ title: "已导出本期 CSV", detail: `ledger-${period}.csv（汇总口径）` });
+            }}
+            disabled={!ledger.data}
+          >
+            导出本期
+          </Button>
+          <Segmented options={periods} value={period ?? ""} onChange={setSelected} />
+        </div>
       </header>
 
       <div className="mb-4 grid grid-cols-2 gap-3 sm:grid-cols-4">

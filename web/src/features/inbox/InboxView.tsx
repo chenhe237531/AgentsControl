@@ -12,7 +12,7 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 
 import { AsyncBoundary } from "@/components/AsyncBoundary";
-import { Badge, Button, Card, CardHeader, Segmented } from "@/components/ui";
+import { Badge, Button, Card, CardHeader, FormField, Segmented, useToast } from "@/components/ui";
 import {
   useCreateGoal,
   useCreateIntake,
@@ -42,6 +42,7 @@ export function InboxView() {
   const [track, setTrack] = useState<"growth" | "money">("growth");
   const [budgetHours, setBudgetHours] = useState(4);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const toast = useToast();
 
   const list = useIntakeItems();
   const create = useCreateIntake();
@@ -59,6 +60,7 @@ export function InboxView() {
       onSuccess: () => {
         setText("");
         inputRef.current?.focus();
+        toast.push({ title: "已记下", detail: "体感被接住了，完整性交给 AI。" });
       },
     });
   };
@@ -178,16 +180,19 @@ export function InboxView() {
                   />
                 </div>
                 {track === "growth" ? (
-                  <label className="flex items-center justify-between text-[12px] text-muted">
-                    预算小时
-                    <input
-                      type="number"
-                      min={1}
-                      value={budgetHours}
-                      onChange={(e) => setBudgetHours(Number(e.target.value))}
-                      className="w-20 rounded border border-line bg-canvas px-2 py-1 text-ink"
-                    />
-                  </label>
+                  <FormField label="预算小时" hint="进化目标的预算货币是注意力，不是钱">
+                    {({ fieldId, describedBy }) => (
+                      <input
+                        id={fieldId}
+                        aria-describedby={describedBy}
+                        type="number"
+                        min={1}
+                        value={budgetHours}
+                        onChange={(e) => setBudgetHours(Number(e.target.value))}
+                        className="input w-24"
+                      />
+                    )}
+                  </FormField>
                 ) : null}
                 <Button
                   variant="primary"
@@ -204,7 +209,12 @@ export function InboxView() {
                         budget_hours: track === "growth" ? budgetHours : null,
                         intake_item_id: active.item_id,
                       },
-                      { onSuccess: () => setActive(null) },
+                      {
+                        onSuccess: () => {
+                          setActive(null);
+                          toast.push({ title: "已转成目标卡", detail: "去「目标」页看它的止损与预算。" });
+                        },
+                      },
                     );
                   }}
                 >

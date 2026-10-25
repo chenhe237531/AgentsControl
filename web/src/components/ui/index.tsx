@@ -5,7 +5,7 @@
  * 颜色一律走 globals.css 的 CSS 变量（--ink/--muted/--line/--brand/--ok/--warn/--danger）。
  */
 
-import type { ButtonHTMLAttributes, ReactNode } from "react";
+import type { ComponentPropsWithRef, ReactNode } from "react";
 
 export function Card({
   children,
@@ -53,7 +53,7 @@ export function Badge({ children, tone = "neutral" }: { children: ReactNode; ton
   );
 }
 
-type ButtonProps = ButtonHTMLAttributes<HTMLButtonElement> & {
+type ButtonProps = ComponentPropsWithRef<"button"> & {
   variant?: "primary" | "ghost" | "danger";
   size?: "sm" | "md";
 };
@@ -192,3 +192,12 @@ export function Segmented<T extends string>({
     </div>
   );
 }
+
+// ---------------------------------------------------------------- 复合组件 v1.0
+export { ToastProvider, useToast } from "@/components/ui/Toast";
+export { ConfirmDialog } from "@/components/ui/ConfirmDialog";
+export type { ConfirmDialogProps } from "@/components/ui/ConfirmDialog";
+export { Drawer } from "@/components/ui/Drawer";
+export { DataTable } from "@/components/ui/DataTable";
+export type { DataTableColumn } from "@/components/ui/DataTable";
+export { FormField } from "@/components/ui/FormField";

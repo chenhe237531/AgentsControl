@@ -23,7 +23,10 @@ export function daysLeft(iso: string | null): number | null {
 
 export function shortDate(iso: string | null): string {
   if (!iso) return "—";
-  return new Date(iso).toLocaleDateString("zh-CN", { month: "2-digit", day: "2-digit" });
+  // timeZone 必须钉死：服务端（Docker TZ=UTC）与客户端（用户本地时区）对同一时刻
+  // 可能算出不同日历日（如恰跨 UTC 零点），Intl 按各自时区渲染 → hydration #418。
+  // 产品语境为中文/人民币，统一按 Asia/Shanghai 展示，两端字符串恒等。
+  return new Date(iso).toLocaleDateString("zh-CN", { month: "2-digit", day: "2-digit", timeZone: "Asia/Shanghai" });
 }
 
 export function timeAgo(iso: string | null): string {

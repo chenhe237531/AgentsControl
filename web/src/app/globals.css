@@ -3,26 +3,31 @@
 @tailwind utilities;
 
 /*
- * 控制台令牌（浅色）。语义：
- * canvas  = 页面底色
- * surface = 卡片/面板
- * line    = 分隔线
- * ink     = 主文字；muted = 次文字
- * brand   = 主色（交互）
- * ok/warn/danger = 状态色
+ * 控制台令牌 v1.1（浅色默认 + 暗色组）。
+ *
+ * 语义：
+ *   canvas  = 页面底色      surface = 卡片/面板   line = 分隔线
+ *   ink     = 主文字        muted   = 次文字      brand = 主色（交互）
+ *   ok/warn/danger = 状态色
  * 注：这是"控制台"，不是股票行情，涨跌色规则不适用；告警用 danger。
+ *
+ * v1.1 变更：9 个核心色改为 RGB 通道（空格分隔），Tailwind 以
+ * `rgb(var(--x) / <alpha-value>)` 消费——透明度修饰符（bg-brand/10 等）
+ * 由此生效。直接取完整色值处一律写 `rgb(var(--x))`。
+ * 暗色组挂在 html.dark 上，由 layout 的内联脚本按 localStorage /
+ * prefers-color-scheme 预置，避免首屏闪烁。
  */
 :root {
-  --canvas: #f7f8fa;
-  --surface: #ffffff;
-  --line: #e3e6ec;
-  --ink: #1a1d24;
-  --muted: #6b7280;
-  --brand: #2f5cf6;
-  --ok: #12805c;
-  --warn: #b45309;
-  --danger: #b42318;
-  /* 图表系列色与语义色：只在这里出现 hex，组件一律引用变量 */
+  --canvas: 247 248 250;
+  --surface: 255 255 255;
+  --line: 227 230 236;
+  --ink: 26 29 36;
+  --muted: 107 114 128;
+  --brand: 47 92 246;
+  --ok: 18 128 92;
+  --warn: 180 83 9;
+  --danger: 180 35 24;
+  /* 图表系列色与语义色：完整色值（不经 Tailwind 透明度），只在这里出现 hex */
   --chart-4: #6b5bd6;
   --chart-5: #0e7490;
   --caution: #d9a300;
@@ -31,6 +36,25 @@
   --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB",
     "Microsoft YaHei", sans-serif;
   --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  color-scheme: light;
+}
+
+html.dark {
+  --canvas: 17 19 23;
+  --surface: 26 29 36;
+  --line: 52 57 68;
+  --ink: 232 234 238;
+  --muted: 148 155 168;
+  --brand: 122 156 255;
+  --ok: 64 196 146;
+  --warn: 240 158 90;
+  --danger: 246 113 113;
+  --chart-4: #9a8df5;
+  --chart-5: #2fc4de;
+  --caution: #e6bc4a;
+  --caution-ink: #111317;
+  --on-strong: #111317;
+  color-scheme: dark;
 }
 
 html,
@@ -39,16 +63,16 @@ body {
 }
 
 body {
-  background-color: var(--canvas);
-  color: var(--ink);
+  background-color: rgb(var(--canvas));
+  color: rgb(var(--ink));
   font-family: var(--font-sans);
   -webkit-font-smoothing: antialiased;
 }
 
 /* 骨架期的占位卡片：W10 会逐页替换为真实视图 */
 .placeholder-card {
-  border: 1px dashed var(--line);
-  background: var(--surface);
+  border: 1px dashed rgb(var(--line));
+  background: rgb(var(--surface));
   border-radius: 10px;
 }
 
@@ -58,6 +82,6 @@ body {
     @apply w-full rounded-md border border-line bg-canvas px-2.5 py-1.5 text-[13px] text-ink outline-none;
   }
   .input:focus {
-    border-color: var(--brand);
+    border-color: rgb(var(--brand));
   }
 }

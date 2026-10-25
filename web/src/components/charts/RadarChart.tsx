@@ -15,7 +15,13 @@ const SIZE = 300;
 const CENTER = SIZE / 2;
 const RADIUS = 112;
 
-const COLORS = ["var(--brand)", "var(--ok)", "var(--warn)", "var(--danger)", "var(--chart-4)"];
+const COLORS = [
+  "rgb(var(--brand))",
+  "rgb(var(--ok))",
+  "rgb(var(--warn))",
+  "rgb(var(--danger))",
+  "var(--chart-4)",
+];
 
 function point(index: number, total: number, value: number): [number, number] {
   const angle = (Math.PI * 2 * index) / total - Math.PI / 2;
@@ -50,7 +56,7 @@ export function RadarChart({
             key={ring}
             points={dimensions.map((_, i) => point(i, total, ring).join(",")).join(" ")}
             fill="none"
-            stroke="var(--line)"
+            stroke="rgb(var(--line))"
             strokeDasharray={ring === 100 ? undefined : "3 3"}
           />
         ))}
@@ -60,14 +66,14 @@ export function RadarChart({
           const [lx, ly] = point(i, total, 122);
           return (
             <g key={dim.dimension}>
-              <line x1={CENTER} y1={CENTER} x2={x} y2={y} stroke="var(--line)" />
+              <line x1={CENTER} y1={CENTER} x2={x} y2={y} stroke="rgb(var(--line))" />
               <text
                 x={lx}
                 y={ly}
                 fontSize={10}
                 textAnchor={lx > CENTER + 10 ? "start" : lx < CENTER - 10 ? "end" : "middle"}
                 dominantBaseline="middle"
-                fill={dim.status === "insufficient" ? "var(--muted)" : "var(--ink)"}
+                fill={dim.status === "insufficient" ? "rgb(var(--muted))" : "rgb(var(--ink))"}
               >
                 {dim.label}
               </text>

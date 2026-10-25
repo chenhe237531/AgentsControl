@@ -71,6 +71,12 @@ export async function mockApi(page: Page): Promise<{ calls: Call[] }> {
     const path = url.pathname.replace(/^\/api\/v1/, "");
     const method = request.method();
     const body = request.postDataJSON?.() ?? null;
+
+    // 度量上报是基础设施：吃掉即可，不进 calls（避免污染各 spec 的请求计数断言）
+    if (path === "/metrics/events") {
+      return json(route, 204, null);
+    }
+
     calls.push({ method, path, body });
 
     if (method === "GET" && path === "/approvals/queue") {
@@ -153,6 +159,21 @@ export async function mockApi(page: Page): Promise<{ calls: Call[] }> {
 
     if (method === "GET" && ["/evals/skills", "/evals/cards", "/evals/harness", "/evals/drift"].includes(path)) {
       return json(route, 200, []);
+    }
+
+    if (method === "POST" && path === "/evals/runs") {
+      return json(route, 201, {
+        id: "run-e2e-0001",
+        week: "2026-W42",
+        status: "queued",
+        models: (body as { models?: string[] })?.models ?? [],
+        cost_cap_usd: 20,
+        cost_used_usd: 0,
+        task_count: 20,
+        error: null,
+        created_at: NOW,
+        finished_at: null,
+      });
     }
 
     if (method === "POST" && /^\/approvals\/[^/]+\/decide$/.test(path)) {

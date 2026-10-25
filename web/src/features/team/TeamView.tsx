@@ -7,19 +7,44 @@
  * 让人误以为在线状态已可用，比空页面更糟。
  */
 
-import { Badge, Card, CardHeader } from "@/components/ui";
+import { Badge, Card, CardHeader, DataTable, type DataTableColumn } from "@/components/ui";
 
-const MATRIX = [
-  { name: "常用 Mac 主机", gui: true, orca: true, browser: true, docker: true, sleep: false, work: "开发、桌面自动化、Orca 宿主" },
-  { name: "远程 Mac mini", gui: true, orca: true, browser: true, docker: true, sleep: false, work: "常驻 Agent、夜间批处理" },
-  { name: "笔记本", gui: true, orca: true, browser: true, docker: false, sleep: true, work: "轻任务（绝不派 always_on）" },
-  { name: "云服务器", gui: false, orca: false, browser: true, docker: true, sleep: false, work: "抓取、计算、常驻" },
-  { name: "第三方平台", gui: false, orca: false, browser: false, docker: false, sleep: false, work: "纯 API 能力（不接指令）" },
-] as const;
+interface MatrixRow {
+  id: string;
+  name: string;
+  gui: boolean;
+  orca: boolean;
+  browser: boolean;
+  docker: boolean;
+  sleep: boolean;
+  work: string;
+}
+
+const MATRIX: MatrixRow[] = [
+  { id: "mac-host", name: "常用 Mac 主机", gui: true, orca: true, browser: true, docker: true, sleep: false, work: "开发、桌面自动化、Orca 宿主" },
+  { id: "mac-mini", name: "远程 Mac mini", gui: true, orca: true, browser: true, docker: true, sleep: false, work: "常驻 Agent、夜间批处理" },
+  { id: "laptop", name: "笔记本", gui: true, orca: true, browser: true, docker: false, sleep: true, work: "轻任务（绝不派 always_on）" },
+  { id: "cloud", name: "云服务器", gui: false, orca: false, browser: true, docker: true, sleep: false, work: "抓取、计算、常驻" },
+  { id: "3p", name: "第三方平台", gui: false, orca: false, browser: false, docker: false, sleep: false, work: "纯 API 能力（不接指令）" },
+];
 
 function Mark({ ok, label }: { ok: boolean; label: string }) {
   return ok ? <Badge tone="ok">{label}</Badge> : <span className="text-[11px] text-muted">—</span>;
 }
+
+const COLUMNS: DataTableColumn<MatrixRow>[] = [
+  { key: "name", header: "设备", render: (row) => <span className="font-medium">{row.name}</span> },
+  { key: "gui", header: "GUI", render: (row) => <Mark ok={row.gui} label="有" /> },
+  { key: "orca", header: "Orca", render: (row) => <Mark ok={row.orca} label="有" /> },
+  { key: "browser", header: "浏览器", render: (row) => <Mark ok={row.browser} label="有" /> },
+  { key: "docker", header: "容器", render: (row) => <Mark ok={row.docker} label="有" /> },
+  {
+    key: "sleep",
+    header: "可休眠",
+    render: (row) => (row.sleep ? <Badge tone="warn">会</Badge> : <Badge tone="ok">不会</Badge>),
+  },
+  { key: "work", header: "适合派什么", render: (row) => <span className="text-muted">{row.work}</span> },
+];
 
 export function TeamView() {
   return (
@@ -37,36 +62,7 @@ export function TeamView() {
           hint="任务声明 requires；不匹配就不派 —— 尤其 always_on 绝不派给会休眠的机器"
           right={<Badge tone="warn">非实时</Badge>}
         />
-        <div className="overflow-x-auto">
-          <table className="w-full text-left text-[12px]">
-            <thead className="bg-canvas text-[11px] text-muted">
-              <tr>
-                <th className="px-3 py-2 font-medium">设备</th>
-                <th className="px-3 py-2 font-medium">GUI</th>
-                <th className="px-3 py-2 font-medium">Orca</th>
-                <th className="px-3 py-2 font-medium">浏览器</th>
-                <th className="px-3 py-2 font-medium">容器</th>
-                <th className="px-3 py-2 font-medium">可休眠</th>
-                <th className="px-3 py-2 font-medium">适合派什么</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-line">
-              {MATRIX.map((row) => (
-                <tr key={row.name}>
-                  <td className="px-3 py-2 font-medium">{row.name}</td>
-                  <td className="px-3 py-2"><Mark ok={row.gui} label="有" /></td>
-                  <td className="px-3 py-2"><Mark ok={row.orca} label="有" /></td>
-                  <td className="px-3 py-2"><Mark ok={row.browser} label="有" /></td>
-                  <td className="px-3 py-2"><Mark ok={row.docker} label="有" /></td>
-                  <td className="px-3 py-2">
-                    {row.sleep ? <Badge tone="warn">会</Badge> : <Badge tone="ok">不会</Badge>}
-                  </td>
-                  <td className="px-3 py-2 text-muted">{row.work}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+        <DataTable columns={COLUMNS} rows={MATRIX} />
       </Card>
 
       <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">

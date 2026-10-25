@@ -1,0 +1,110 @@
+# 本地单机部署（Docker Desktop）：一条命令拉起 API + Web + PG + Redis + Caddy。
+# 与生产 docker-compose.yml 的差别只有三点：
+#   1. APP_ENV=dev，不做生产密钥强校验；
+#   2. Caddy 走纯 HTTP :8080，不需要域名/证书；
+#   3. 不启用 read_only/tmpfs 等生产加固，方便本地排查。
+#
+# 用法：
+#   cp .env.example .env        # 首次，填本地值
+#   docker compose -f deploy/docker-compose.local.yml up -d --build
+#   打开 http://localhost:8080 ；API 文档 http://localhost:8080/docs
+name: afc-local
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-afc}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-afc_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-afc}
+      TZ: Asia/Shanghai
+    volumes:
+      - pgdata_local:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-afc} -d ${POSTGRES_DB:-afc}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    logging: *default-logging
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    logging: *default-logging
+
+  migrate:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    command: ["alembic", "upgrade", "head"]
+    env_file: [../.env]
+    environment:
+      APP_ENV: dev
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-afc}:${POSTGRES_PASSWORD:-afc_dev_password}@db:5432/${POSTGRES_DB:-afc}
+      DATABASE_URL_SYNC: postgresql+psycopg://${POSTGRES_USER:-afc}:${POSTGRES_PASSWORD:-afc_dev_password}@db:5432/${POSTGRES_DB:-afc}
+    depends_on:
+      db: { condition: service_healthy }
+    restart: "no"
+    logging: *default-logging
+
+  api:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: [../.env]
+    environment:
+      APP_ENV: dev
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-afc}:${POSTGRES_PASSWORD:-afc_dev_password}@db:5432/${POSTGRES_DB:-afc}
+      DATABASE_URL_SYNC: postgresql+psycopg://${POSTGRES_USER:-afc}:${POSTGRES_PASSWORD:-afc_dev_password}@db:5432/${POSTGRES_DB:-afc}
+      REDIS_URL: redis://redis:6379/0
+      GIT_SHA: ${GIT_SHA:-local}
+    ports: ["8000:8000"]
+    depends_on:
+      db: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+    logging: *default-logging
+
+  web:
+    build:
+      context: ../web
+      dockerfile: Dockerfile
+      args:
+        # 同源：浏览器访问 :8080，API 也走 :8080/api/v1
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8080/api/v1}
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+    expose: ["3000"]
+    depends_on: [api]
+    logging: *default-logging
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports: ["8080:8080"]
+    volumes:
+      - ./Caddyfile.local:/etc/caddy/Caddyfile:ro
+      - caddy_local_data:/data
+      - caddy_local_config:/config
+    depends_on: [api, web]
+    logging: *default-logging
+
+volumes:
+  pgdata_local:
+  caddy_local_data:
+  caddy_local_config:

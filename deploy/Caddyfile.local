@@ -1,0 +1,39 @@
+# 本地单机部署：纯 HTTP，不需要域名与证书。
+# 对外只暴露 :8080，同源反代 web 与 api，前端因此无需跨域。
+{
+	auto_https off
+	admin off
+	log {
+		level ERROR
+	}
+}
+
+:8080 {
+	encode zstd gzip
+
+	# 前端同源调用 API
+	handle /api/* {
+		reverse_proxy api:8000
+	}
+
+	# 健康检查与 API 文档也走 API
+	handle /health {
+		reverse_proxy api:8000
+	}
+
+	handle /docs* {
+		reverse_proxy api:8000
+	}
+
+	handle /redoc* {
+		reverse_proxy api:8000
+	}
+
+	handle /openapi.json {
+		reverse_proxy api:8000
+	}
+
+	handle {
+		reverse_proxy web:3000
+	}
+}
